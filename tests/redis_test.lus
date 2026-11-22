@@ -1586,3 +1586,13 @@ local function real_stores_test()
         r:del(key)
     end
 end
+
+-- A command returns exactly one value, also under RESP2 where the reply is
+-- reshaped inside a function that holds a <close> connection.
+local function call_returns_one_value_test()
+    local env <close> = setup(nil, { protocol = 2 })
+    local r = env.r
+    r:hset("h", { a = 1 })
+    assert(select("#", r:hgetall("h")) == 1)
+    assert(select("#", r:get("missing")) == 1)
+end
