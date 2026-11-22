@@ -65,7 +65,7 @@ local concat, sort from table
 local byte, sub, find, upper, format, match, gmatch from string
 local floor, ceil, max_of, math_type = math.floor, math.ceil, math.max, math.type
 local v_tostring, v_fromstring, v_create, v_copy = vector.tostring, vector.fromstring, vector.create, vector.copy
-local create, detach, resume, close, sleep from coroutine
+local resume, close, sleep from coroutine
 
 -- Errors ------------------------------------------------------------------------
 
@@ -704,14 +704,6 @@ local Waiter = {
     end,
 }
 
--- The body of the detached coroutine that waits in the sleep of a waiter.
--- A sleep can be closed while a detached coroutine waits in it, so the
--- caller resumes this coroutine, which works from the main chunk and from
--- every kind of coroutine.
-local function park(s)
-    resume(s)
-end
-
 -- Takes a connection from the pool, opening one when the pool has room.
 -- The caller declares the result with `<close>`, which returns it. When the
 -- pool is full the caller joins the end of `pool.waiters`, and connections
@@ -742,7 +734,7 @@ local function checkout(pool)
             taken = false,
         }, Waiter)
         waiters[#waiters + 1] = waiter
-        resume(detach(create(park), waiter.sleep))
+        resume(waiter.sleep)
         granted, conn = waiter.granted, waiter.conn
         waiter.taken = granted
     end
