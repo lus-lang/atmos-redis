@@ -11,6 +11,19 @@ package.path = `$(table.concat(path, ";"));$(package.path)`
 -- the checkout next to this one in its place.
 package.preload["https://atmosp.here/2.0/cookie.lus"] = function() return require("cookie") end
 
+-- Counts the sleeps that never run out, which are the waits for the pool.
+-- The package reads `coroutine.sleep` when it loads.
+local parks = 0
+do
+    local sleep = coroutine.sleep
+    coroutine.sleep = function(seconds)
+        if seconds == math.huge then
+            parks = parks + 1
+        end
+        return sleep(seconds)
+    end
+end
+
 local redis = require("redis")
 local fake = require("fake_redis")
 
@@ -140,7 +153,7 @@ local function connection_refused_test()
 end
 
 -- A server that answers the TLS greeting of the client with plain text.
-local function tls_url_test()
+local function tls_to_plain_server_test()
     local listener <close> = network.tcp.bind("127.0.0.1", 0)
     local _, port = listener:getsockname()
     local serving = coroutine.detach(coroutine.create(function()
@@ -149,7 +162,7 @@ local function tls_url_test()
         sock:send("-ERR this server speaks plain text\r\n")
     end))
     local err = failure(function() redis.connect(`rediss://127.0.0.1:$port`, { tls = { verify = false }, timeout = 5 }) end)
-    assert(redis.is_error(err) and err.code == "CONNECTION")
+    assert(redis.is_error(err) and err.code == "CONNECTION" and err.timeout == nil)
     assert(tostring(err):find("TLS", 1, true), tostring(err))
     coroutine.close(serving)
 end
@@ -747,6 +760,130 @@ local function pool_main_waits_test()
     assert(server.accepted == 1)
 end
 
+-- Runs the detached coroutines until each waits for something.
+local function turn()
+    coroutine.resume(coroutine.detach(coroutine.create(function()
+        for _ = 1, 3 do
+            coroutine.yield()
+        end
+    end)))
+end
+
+local function pool_waiters_park_test()
+    local env <close> = setup(nil, { pool = 1 })
+    local r, server from env
+    local order = {}
+    local gate = coroutine.sleep(math.huge)
+    local before = parks
+    local holder = coroutine.detach(coroutine.create(function()
+        r:transaction(function() coroutine.resume(gate) end)
+        -- The connection went to the first waiter, so this call joins the
+        -- end of the list.
+        r:ping()
+        order[#order + 1] = "holder"
+    end))
+    turn()
+    assert(#r.idle == 0 and #r.waiters == 0)
+    local waiters = {}
+    for i = 1, 3 do
+        waiters[i] = coroutine.detach(coroutine.create(function()
+            assert(r:echo(`w$i`) == `w$i`)
+            order[#order + 1] = i
+        end))
+    end
+    turn()
+    assert(#r.waiters == 3 and parks == before + 3)
+    -- A waiter stays parked while other coroutines run.
+    local spins = 0
+    coroutine.resume(coroutine.detach(coroutine.create(function()
+        for _ = 1, 500 do
+            spins = spins + 1
+            coroutine.yield()
+        end
+    end)))
+    assert(spins == 500 and #r.waiters == 3 and parks == before + 3)
+    assert(#order == 0)
+    coroutine.close(gate)
+    assert(coroutine.resume(holder))
+    for i = 1, 3 do
+        coroutine.resume(waiters[i])
+    end
+    assert(table.concat(order, ",") == "1,2,3,holder", table.concat(order, ","))
+    assert(parks == before + 4)
+    assert(server.accepted == 1 and r.size == 1 and #r.idle == 1 and #r.waiters == 0)
+end
+
+local function pool_plain_coroutine_waits_test()
+    local env <close> = setup(nil, { pool = 1 })
+    local r, server from env
+    local gate = coroutine.sleep(0.02)
+    local holder = coroutine.detach(coroutine.create(function()
+        r:transaction(function() coroutine.resume(gate) end)
+    end))
+    turn()
+    assert(#r.idle == 0)
+    local before = parks
+    local plain = coroutine.wrap(function() return r:ping() end)
+    assert(plain() == "PONG")
+    assert(parks == before + 1 and server.accepted == 1)
+    assert(coroutine.resume(holder))
+    -- The main chunk waits the same way.
+    gate = coroutine.sleep(0.02)
+    holder = coroutine.detach(coroutine.create(function()
+        r:transaction(function() coroutine.resume(gate) end)
+    end))
+    turn()
+    assert(r:ping() == "PONG" and parks == before + 2 and server.accepted == 1)
+end
+
+local function pool_cancelled_waiter_test()
+    local env <close> = setup(nil, { pool = 1 })
+    local r, server from env
+    local gate = coroutine.sleep(math.huge)
+    local first, second, third
+    local holder = coroutine.detach(coroutine.create(function()
+        r:transaction(function() coroutine.resume(gate) end)
+        -- The connection is on its way to the second waiter, which passes
+        -- it on when it is cancelled before it runs.
+        assert(#r.waiters == 1 and #r.idle == 0)
+        coroutine.close(second)
+    end))
+    turn()
+    local got = {}
+    first = coroutine.detach(coroutine.create(function() got[#got + 1] = "first" r:ping() end))
+    second = coroutine.detach(coroutine.create(function() r:ping() got[#got + 1] = "second" end))
+    third = coroutine.detach(coroutine.create(function() r:ping() got[#got + 1] = "third" end))
+    turn()
+    assert(#r.waiters == 3)
+    -- A waiter that is cancelled in its wait leaves the list.
+    assert(coroutine.close(first))
+    assert(#r.waiters == 2)
+    coroutine.close(gate)
+    assert(coroutine.resume(holder))
+    assert(coroutine.resume(third))
+    assert(table.concat(got, ",") == "first,third", table.concat(got, ","))
+    assert(server.accepted == 1 and r.size == 1 and #r.idle == 1 and #r.waiters == 0)
+end
+
+local function pool_close_wakes_waiters_test()
+    local env <close> = setup(nil, { pool = 1 })
+    local r = env.r
+    local gate = coroutine.sleep(math.huge)
+    local holder = coroutine.detach(coroutine.create(function()
+        r:transaction(function() coroutine.resume(gate) end)
+    end))
+    turn()
+    local waiter = coroutine.detach(coroutine.create(function() return r:ping() end))
+    turn()
+    assert(#r.waiters == 1)
+    r:close()
+    local ok, err = coroutine.resume(waiter)
+    assert(not ok and redis.is_error(err) and err.code == "CONNECTION")
+    coroutine.close(gate)
+    coroutine.resume(holder)
+    assert(r.size == 0 and #r.waiters == 0)
+end
+
 local function broken_connection_test()
     local env <close> = setup()
     local r, server from env
@@ -760,10 +897,140 @@ local function broken_connection_test()
     assert(r:ping() == "PONG" and server.accepted == 3 and r.size == 1)
 end
 
+-- A certificate authority and a certificate for localhost that exist for
+-- these tests alone. The private key below protects nothing.
+local TEST_CA = [[
+-----BEGIN CERTIFICATE-----
+MIIBOjCB4KADAgECAgkArFZh7wvzjlIwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwE
+dGVzdDAgFw0yNjExMjIyMDMxMzlaGA8yMTI2MTAyOTIwMzEzOVowDzENMAsGA1UE
+AwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKnZpJDxX4L12/+CUmQ0
+avXBuiAqxtui96/+nJlM9h5zkRhDwGap5hfan36TbSaMJL0j5+/LRRwu5i4mD4/c
+6rajIzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49
+BAMCA0kAMEYCIQC7KTov+iRa/nHXGL9S6TRrc3lsa1PGhAFTbkeQcwT6/wIhAOou
+z0VsnonOQohEYCoMNNg+GJvmZnIl3Gmef+PnTaJp
+-----END CERTIFICATE-----
+]]
+
+local TEST_CERT = [[
+-----BEGIN CERTIFICATE-----
+MIIBSTCB8KADAgECAgkAg9hAGvC0HYIwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwE
+dGVzdDAgFw0yNjExMjIyMDMxMzlaGA8yMTI2MTAyOTIwMzEzOVowDzENMAsGA1UE
+AwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABImuymK5UZZZrjzTNl34
+O6Bwf1nGvh/7KWuhpdcB8bH02ikuOG1mWfszlyimheUe1snDIsCYrNCF+WvBTamh
+W6OjMzAxMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATATBgNVHSUEDDAKBggr
+BgEFBQcDATAKBggqhkjOPQQDAgNIADBFAiBRwzdnWxmM2wQm0Ew0ikUBO7fhDoK6
+iT0nJlb6EfVKGwIhAIuiVCUsUsAiyR+ez3RewleOvD2QWUAx68coQj9QGpZh
+-----END CERTIFICATE-----
+]]
+
+local TEST_KEY = [[
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEICc9PEBZG/695GHAWhyQnfwP/P8qs1KeHJdPwJWL7DHcoAoGCCqGSM49
+AwEHoUQDQgAEia7KYrlRllmuPNM2Xfg7oHB/Wca+H/spa6Gl1wHxsfTaKS44bWZZ
++zOXKKaF5R7WycMiwJis0IX5a8FNqaFbow==
+-----END EC PRIVATE KEY-----
+]]
+
+local SERVER_TLS = { server = true, cert = TEST_CERT, key = TEST_KEY }
+
+local function rediss_test()
+    local env <close> = setup({ tls = SERVER_TLS, password = "secret" }, { tls = { ca = TEST_CA }, password = "secret", timeout = 5 })
+    local r, server from env
+    assert(server.url:find("^rediss://localhost:"))
+    assert(r.resp == 3 and r:ping() == "PONG")
+    -- A value larger than one TLS record goes both ways.
+    local big = string.rep("0123456789abcdef", 8192)
+    r:set("big", big)
+    assert(r:get("big") == big)
+    local replies = r:pipeline(function(p)
+        p:incr("n")
+        p:incr("n")
+    end)
+    assert(replies[1] == 1 and replies[2] == 2)
+    -- A subscription opens a TLS connection of its own.
+    local got = {}
+    local listening = coroutine.detach(coroutine.create(function()
+        for channel, message in r:subscribe("news") do
+            got[#got + 1] = `$channel=$message`
+            if message == "last" then
+                break
+            end
+        end
+    end))
+    settle(r, function() return next(server.channels) ~= nil end)
+    r:publish("news", "first")
+    r:publish("news", "last")
+    settle(r, function() return coroutine.status(listening) == "dead" end)
+    assert(got[1] == "news=first" and got[2] == "news=last")
+    -- The valkeys scheme means the same.
+    local other = env:connect({ tls = { ca = TEST_CA }, password = "secret" }, `valkeys://localhost:$(server.port)`)
+    assert(other:get("n") == "2")
+end
+
+local function rediss_certificate_test()
+    local env <close> = setup({ tls = SERVER_TLS }, false)
+    local url = env.server.url
+    -- The authorities of the system do not know the test certificate.
+    local err = failure(function() env:connect(nil, url) end)
+    assert(redis.is_error(err) and err.code == "CONNECTION" and err.timeout == nil)
+    assert(tostring(err):find("certificate verification failed for localhost", 1, true), tostring(err))
+    err = failure(function() env:connect({ tls = { ca = TEST_CA, servername = "other.test" } }, url) end)
+    assert(tostring(err):find("certificate verification failed for other.test", 1, true), tostring(err))
+    local r = env:connect({ tls = { verify = false } }, `rediss://127.0.0.1:$(env.server.port)`)
+    assert(r:ping() == "PONG")
+end
+
+-- A server that accepts a connection and never answers.
+local function silent_server(body)
+    local listener <close> = network.tcp.bind("127.0.0.1", 0)
+    local _, port = listener:getsockname()
+    local held = {}
+    local serving = coroutine.detach(coroutine.create(function()
+        while true do
+            held[#held + 1] = listener:accept()
+        end
+    end))
+    local ok, err = catch body(port)
+    coroutine.close(serving)
+    for _, sock in ipairs(held) do
+        sock:close()
+    end
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function connect_timeout_test()
+    silent_server(function(port)
+        -- The handshake of TLS and the greeting of the client both wait
+        -- for a server that stays silent.
+        local start = time.monotonic()
+        local err = failure(function() redis.connect(`rediss://127.0.0.1:$port`, { timeout = 0.05 }) end)
+        assert(redis.is_error(err) and err.code == "CONNECTION" and err.timeout == true, tostring(err))
+        assert(tostring(err) == "TLS handshake timeout", tostring(err))
+        err = failure(function() redis.connect(`redis://127.0.0.1:$port`, { timeout = 0.05 }) end)
+        assert(err.code == "CONNECTION" and err.timeout == true and tostring(err) == "receive timeout", tostring(err))
+        assert((time.monotonic() - start):seconds() < 5)
+    end)
+    -- The timeout reaches the connection itself.
+    local connect = network.tcp.connect
+    local seen
+    network.tcp.connect = function(host, port, options)
+        seen = options
+        return connect(host, port, options)
+    end
+    local env <close> = setup(nil, { timeout = 3 })
+    network.tcp.connect = connect
+    assert(seen and seen.timeout == 3)
+    assert(env.r:ping() == "PONG")
+end
+
 local function timeout_test()
     local env <close> = setup(nil, { timeout = 0.05 })
     local r, server from env
-    raises(function() r:call("FAKE", "silent") end, "receive timeout")
+    local err = failure(function() r:call("FAKE", "silent") end)
+    assert(redis.is_error(err) and err.code == "CONNECTION" and err.timeout == true)
+    assert(err.message == "receive timeout")
     -- The connection with a reply still on its way is closed.
     assert(r.size == 0)
     assert(r:ping() == "PONG" and server.accepted == 2)

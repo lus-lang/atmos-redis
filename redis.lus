@@ -29,7 +29,8 @@
 --- `message`, the text of the server, and `code`, the first word of that
 --- text, such as `"WRONGTYPE"` or `"NOSCRIPT"`. `tostring` returns the
 --- message. A connection that fails raises an error object with the code
---- `"CONNECTION"`. A reply that breaks the protocol raises one with the
+--- `"CONNECTION"`, whose `timeout` field is `true` when a wait ran out of
+--- time. A reply that breaks the protocol raises one with the
 --- code `"PROTOCOL"`. `redis.is_error` recognizes these objects, which
 --- pipelines and transactions return in place of the reply of a command that
 --- failed.
@@ -37,7 +38,8 @@
 --- Every call waits on a socket, so inside a detached coroutine it suspends
 --- that coroutine while the others run. Each coroutine that sends a command
 --- takes a connection from the pool for the length of that command. When
---- every connection is taken, the caller waits until one returns.
+--- every connection is taken, the caller waits until one returns. Waiting
+--- callers receive connections in the order of their arrival.
 ---
 --- The client opens a connection with `HELLO 3`. A server that lacks the
 --- command keeps the RESP2 protocol, in which the client converts the
@@ -63,7 +65,7 @@ local concat, sort from table
 local byte, sub, find, upper, format, match, gmatch from string
 local floor, ceil, max_of, math_type = math.floor, math.ceil, math.max, math.type
 local v_tostring, v_fromstring, v_create, v_copy = vector.tostring, vector.fromstring, vector.create, vector.copy
-local create, detach, resume, yield from coroutine
+local create, detach, resume, close, sleep from coroutine
 
 -- Errors ------------------------------------------------------------------------
 
@@ -210,9 +212,24 @@ end
 -- The second result of `read` for an error reply and for a push message.
 local ERR, PUSH = 1, 2
 
-local function fail(conn, code, message)
+-- Returns the error object for a failure of the socket. `cause` is the
+-- error object of the socket, whose code "timeout" sets the `timeout` field.
+local function socket_error(cause)
+    local err = new_error("CONNECTION", tostring(cause))
+    if type(cause) == "table" and cause.code == "timeout" then
+        err.timeout = true
+    end
+    return err
+end
+
+-- Marks the connection as broken and raises an error object. `cause` is a
+-- message, or the error object of a failed socket operation.
+local function fail(conn, code, cause)
     conn.broken = true
-    error(new_error(code, message), 0)
+    if type(cause) == "string" then
+        error(new_error(code, cause), 0)
+    end
+    error(socket_error(cause), 0)
 end
 
 local function send(conn, payload)
@@ -438,17 +455,42 @@ end
 local Conn = {}
 Conn.__index = Conn
 
+-- Wakes the caller that has waited longest for the pool and passes it
+-- `conn`, or the right to open a connection when `conn` is false. Returns
+-- whether a caller waited.
+local function grant(pool, conn)
+    local waiters = pool.waiters
+    local waiter = waiters[1]
+    if not waiter then
+        return false
+    end
+    table.remove(waiters, 1)
+    waiter.granted = true
+    waiter.conn = conn
+    close(waiter.sleep)
+    return true
+end
+
+-- Gives up a place in the pool whose connection is gone. The first waiting
+-- caller takes the place over.
+local function vacate(pool)
+    if pool.closed or not grant(pool, false) then
+        pool.size = pool.size - 1
+    end
+end
+
 -- Returns a connection to its pool, or closes it when a command left it in
--- an unknown state.
+-- an unknown state. A caller that waits for the pool receives the
+-- connection directly.
 Conn.__close = function(conn)
     local pool = conn.pool
     if not pool then
         return
     end
     if conn.busy or conn.broken or conn.watching or pool.closed then
-        pool.size = pool.size - 1
         conn.sock:close()
-    else
+        vacate(pool)
+    elseif not grant(pool, conn) then
         local idle = pool.idle
         idle[#idle + 1] = conn
     end
@@ -500,19 +542,16 @@ end
 
 -- Opens a connection and prepares it with the settings of `config`.
 local function open(config)
-    local sock
-    local ok, err
+    -- The timeout bounds the connection and the TLS handshake, then stays
+    -- on the socket as the timeout of every wait.
+    local sock, err
     if config.tls then
-        ok, err = catch network.tls.connect(config.host, config.port, config.tls)
+        sock, err = network.tls.connect(config.host, config.port, config.tls)
     else
-        ok, err = catch network.tcp.connect(config.host, config.port)
+        sock, err = network.tcp.connect(config.host, config.port, config.connect)
     end
-    if not ok then
-        error(new_error("CONNECTION", tostring(err)), 0)
-    end
-    sock = err
-    if config.timeout and not config.tls then
-        sock:settimeout(config.timeout)
+    if sock == nil then
+        error(socket_error(err), 0)
     end
     local conn = setmetatable({
         sock = sock,
@@ -622,50 +661,100 @@ local ClientMeta = { __index = Client, __name = "redis.client" }
 local Slot = {
     __close = function(slot)
         if not slot.kept then
-            local pool = slot.pool
-            pool.size = pool.size - 1
+            vacate(slot.pool)
         end
     end,
 }
 
--- The body of the coroutine that waiting callers resume. It ends when a
--- connection is free or the pool has room.
-local function gate_body(pool)
-    while not pool.closed and #pool.idle == 0 and pool.size >= pool.max do
-        yield()
-    end
-    pool.gate = false
+-- Opens a connection for a place that `pool.size` already counts.
+local function open_place(pool)
+    local slot <close> = setmetatable({ pool = pool, kept = false }, Slot)
+    local conn = open(pool.config)
+    conn.pool = pool
+    slot.kept = true
+    return conn
+end
+
+-- A caller that waits for the pool. Its `sleep` never runs out, so the
+-- caller uses no processor time until `grant` or `Client:close` closes the
+-- sleep. Leaving the wait without taking what `grant` passed, as a cancelled
+-- coroutine does, hands it to the next caller.
+local Waiter = {
+    __close = function(waiter)
+        local pool = waiter.pool
+        if waiter.taken then
+            return
+        end
+        if waiter.granted then
+            if conn = waiter.conn then
+                Conn.__close(conn)
+            else
+                vacate(pool)
+            end
+            return
+        end
+        local waiters = pool.waiters
+        for i = 1, #waiters do
+            if waiters[i] == waiter then
+                table.remove(waiters, i)
+                break
+            end
+        end
+        close(waiter.sleep)
+    end,
+}
+
+-- The body of the detached coroutine that waits in the sleep of a waiter.
+-- A sleep can be closed while a detached coroutine waits in it, so the
+-- caller resumes this coroutine, which works from the main chunk and from
+-- every kind of coroutine.
+local function park(s)
+    resume(s)
 end
 
 -- Takes a connection from the pool, opening one when the pool has room.
--- The caller declares the result with `<close>`, which returns it.
+-- The caller declares the result with `<close>`, which returns it. When the
+-- pool is full the caller joins the end of `pool.waiters`, and connections
+-- that return go to the waiting callers in the order of their arrival.
 local function checkout(pool)
-    while true do
-        if pool.closed then
-            error(new_error("CONNECTION", "the client is closed"), 0)
-        end
-        local idle = pool.idle
-        local n = #idle
-        if n > 0 then
-            local conn = idle[n]
-            idle[n] = nil
-            return conn
-        end
-        if pool.size < pool.max then
-            pool.size = pool.size + 1
-            local slot <close> = setmetatable({ pool = pool, kept = false }, Slot)
-            local conn = open(pool.config)
-            conn.pool = pool
-            slot.kept = true
-            return conn
-        end
-        local gate = pool.gate
-        if not gate then
-            gate = detach(create(gate_body), pool)
-            pool.gate = gate
-        end
-        resume(gate)
+    if pool.closed then
+        error(new_error("CONNECTION", "the client is closed"), 0)
     end
+    local idle = pool.idle
+    local n = #idle
+    if n > 0 then
+        local conn = idle[n]
+        idle[n] = nil
+        return conn
+    end
+    if pool.size < pool.max then
+        pool.size = pool.size + 1
+        return open_place(pool)
+    end
+    local granted, conn = false, false
+    do
+        local waiters = pool.waiters
+        local waiter <close> = setmetatable({
+            pool = pool,
+            sleep = sleep(math.huge),
+            granted = false,
+            conn = false,
+            taken = false,
+        }, Waiter)
+        waiters[#waiters + 1] = waiter
+        resume(detach(create(park), waiter.sleep))
+        granted, conn = waiter.granted, waiter.conn
+        waiter.taken = granted
+    end
+    if granted then
+        return conn or open_place(pool)
+    end
+    if pool.closed then
+        error(new_error("CONNECTION", "the client is closed"), 0)
+    end
+    -- The resume returns without a grant when every detached coroutine
+    -- waits for another one, so no command can end.
+    error(new_error("CONNECTION", "every connection of the pool is in use and none can return"), 0)
 end
 
 local function percent_decode(text)
@@ -740,7 +829,7 @@ local OPTIONS = {
 --- - `username` and `password`, which the client sends with `AUTH`. A password alone authenticates the user `default`.
 --- - `db`, the number of the database that the client selects with `SELECT`.
 --- - `tls`, which is `true` to connect through TLS, or a table of the client options of `network.tls.connect`, such as `ca` and `servername`.
---- - `timeout`, the seconds that one wait on the socket may last. A command that runs into it raises the timeout error of the socket, which closes its connection.
+--- - `timeout`, the seconds that the connection to the server, its TLS handshake, and then each wait on the socket may last. A connection or a command that runs into it closes the connection and raises an error object with the code `"CONNECTION"` whose `timeout` field is `true`. By default they wait without limit.
 --- - `pool`, the largest number of connections that the client opens, which defaults to 10. The client opens a connection when a command finds none free.
 --- - `client_name`, the name that the connections give to the server.
 --- - `protocol`, which is 2 to keep the RESP2 protocol. By default the client asks for RESP3.
@@ -794,13 +883,14 @@ function M.connect(target, options)
         config.tls = tls
     else
         config.tls = false
+        config.connect = config.timeout and { timeout = config.timeout } or nil
     end
     local client = setmetatable({
         config = config,
         idle = {},
         size = 0,
         max = max_of(1, floor(config.pool or 10)),
-        gate = false,
+        waiters = {},
         closed = false,
         resp = 3,
     }, ClientMeta)
@@ -867,6 +957,13 @@ function Client:close()
         idle[i].sock:close()
         idle[i] = nil
         self.size = self.size - 1
+    end
+    -- The callers that wait for a connection wake up and raise the error
+    -- of a closed client.
+    local waiters = self.waiters
+    self.waiters = {}
+    for i = 1, #waiters do
+        close(waiters[i].sleep)
     end
 end
 
@@ -1223,7 +1320,7 @@ local function subscription(client, command, names)
     end
     local conn = open(config)
     -- A subscription waits for as long as no message arrives.
-    conn.sock:settimeout(-1)
+    conn.sock:settimeout(nil)
     local self = setmetatable({
         conn = conn,
         count = 0,

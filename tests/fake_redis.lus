@@ -122,13 +122,13 @@ local function read_command(sock)
     end
     local args = {}
     for i = 1, count do
-        local head = vector.tostring(sock:receive("*l"))
+        local head = vector.tostring(assert(sock:receive("*l")))
         local len = tonumber(head:match("^%$(%d+)$"))
         local data = vector.create(len)
         local at = 0
         while at < len do
             local part = sock:receive(math.min(len - at, 1 << 20))
-            if #part == 0 then
+            if part == nil or #part == 0 then
                 return nil
             end
             vector.copy(data, at, part)
@@ -1290,7 +1290,11 @@ end
 
 local function handle(conn)
     local server = conn.server
-    catch serve(conn)
+    local tls = server.options.tls
+    -- A server with a certificate serves TLS from the first byte.
+    if not tls or conn.sock:starttls(tls) then
+        catch serve(conn)
+    end
     for name in pairs(conn.channels) do
         server.channels[name][conn] = nil
     end
@@ -1305,8 +1309,8 @@ end
 --- Starts a fake server on a loopback port.
 ---
 --- The options are `password` and `username`, which make the server ask
---- for them, and `resp2`, which makes it refuse `HELLO` as an old server
---- does. The result has the fields `port` and `url`, the clock `now` in
+--- for them, `resp2`, which makes it refuse `HELLO` as an old server does,
+--- and `tls`, the server options of `starttls` with which it serves TLS. The result has the fields `port` and `url`, the clock `now` in
 --- milliseconds that a test moves by hand, the counters `accepted`, `open`,
 --- `loads`, and `script_calls`, the list `log` of the command names it
 --- ran, and the method `stop`.
@@ -1317,7 +1321,7 @@ function F.start(options)
     local server = {
         options = options,
         port = port,
-        url = `redis://127.0.0.1:$port`,
+        url = options.tls and `rediss://localhost:$port` or `redis://127.0.0.1:$port`,
         now = 1000000000,
         dbs = { [0] = {} },
         versions = {},
@@ -1338,8 +1342,8 @@ function F.start(options)
     vector.set(server.blob, 3, 1)
     server.acceptor = coroutine.detach(coroutine.create(function()
         while true do
-            local ok, sock = catch listener:accept()
-            if not ok then
+            local sock = listener:accept()
+            if not sock then
                 return
             end
             server.accepted = server.accepted + 1
