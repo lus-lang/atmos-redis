@@ -1,0 +1,1588 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", `fs:read=$PACKAGES/*`, "network:tcp", "env:read=LUS_TEST_REDIS")
+local path = { `$ROOT/?.lus`, `$TEST_DIR/?.lus` }
+for _, name in ipairs({ "rate_limit", "session", "queue", "cookie", "web" }) do
+    path[#path + 1] = `$PACKAGES/$name/?.lus`
+    path[#path + 1] = `$PACKAGES/atmos-$(name:gsub("_", "-"))/?.lus`
+end
+package.path = `$(table.concat(path, ";"));$(package.path)`
+-- The session package requires cookie by its atmosphere URL. The tests load
+-- the checkout next to this one in its place.
+package.preload["https://atmosp.here/2.0/cookie.lus"] = function() return require("cookie") end
+
+local redis = require("redis")
+local fake = require("fake_redis")
+
+-- Every test talks to a fake server of its own on a loopback port. The
+-- tests at the end of the file run against a real server when the
+-- environment variable LUS_TEST_REDIS holds its URL.
+
+local Env = {
+    __close = function(env)
+        for _, client in ipairs(env.clients) do
+            client:close()
+        end
+        env.server:stop()
+    end,
+}
+
+-- Starts a fake server and connects a client to it. The result closes both
+-- at the end of its scope.
+local function setup(server_options, client_options)
+    local server = fake.start(server_options)
+    local env = setmetatable({ server = server, clients = {} }, Env)
+    function env:connect(options, url)
+        local client = redis.connect(url or server.url, options)
+        self.clients[#self.clients + 1] = client
+        return client
+    end
+    if client_options ~= false then
+        local ok, client = catch env:connect(client_options)
+        if not ok then
+            server:stop()
+            error(client, 0)
+        end
+        env.r = client
+    end
+    return env
+end
+
+local function same(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return a == b
+    end
+    for k, v in pairs(a) do
+        if not same(v, b[k]) then
+            return false
+        end
+    end
+    for k in pairs(b) do
+        if a[k] == nil then
+            return false
+        end
+    end
+    return true
+end
+
+local function count(list, value)
+    local n = 0
+    for _, item in ipairs(list) do
+        if item == value then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function failure(fn)
+    local ok, err = catch fn()
+    assert(not ok, "the call must fail")
+    return err
+end
+
+-- Connections --------------------------------------------------------------------
+
+local function hello_test()
+    local env <close> = setup()
+    local r = env.r
+    assert(r.resp == 3)
+    assert(r.server.server == "fake" and r.server.proto == 3)
+    assert(r:ping() == "PONG")
+    assert(r:echo("hi") == "hi")
+    assert(count(env.server.log, "PING") == 1)
+end
+
+local function url_test()
+    local env <close> = setup({ username = "app", password = "p@ss:word" }, false)
+    local server = env.server
+    local r = env:connect(nil, `redis://app:p%40ss%3Aword@127.0.0.1:$(server.port)/2`)
+    r:set("k", "v")
+    assert(server.dbs[2].k.value == "v" and server.dbs[0].k == nil)
+    -- Options replace the parts of a URL.
+    local other = env:connect({ db = 3, client_name = "worker" }, `valkey://app:p%40ss%3Aword@127.0.0.1:$(server.port)/2`)
+    other:set("k", "w")
+    assert(server.dbs[3].k.value == "w")
+    assert(other:client_getname() == "worker")
+end
+
+local function invalid_arguments_test()
+    raises(function() redis.connect("http://localhost") end, "invalid Redis URL")
+    raises(function() redis.connect("redis://localhost/abc") end, "invalid database")
+    raises(function() redis.connect(42) end, "string or table expected")
+    raises(function() redis.connect({ hostname = "x" }) end, "unknown redis option 'hostname'")
+    raises(function() redis.connect({ port = "6379" }) end, "'port' must be a number")
+end
+
+local function options_table_test()
+    local env <close> = setup()
+    local r = redis.connect({ host = "127.0.0.1", port = env.server.port, pool = 2 })
+    assert(r:ping() == "PONG")
+    r:close()
+end
+
+local function auth_test()
+    local env <close> = setup({ password = "secret" }, { password = "secret" })
+    assert(env.r:ping() == "PONG")
+    local err = failure(function() env:connect({ password = "wrong" }) end)
+    assert(redis.is_error(err) and err.code == "WRONGPASS")
+    err = failure(function() env:connect() end)
+    assert(err.code == "NOAUTH")
+end
+
+local function connection_refused_test()
+    local listener = network.tcp.bind("127.0.0.1", 0)
+    local _, port = listener:getsockname()
+    listener:close()
+    local err = failure(function() redis.connect(`redis://127.0.0.1:$port`) end)
+    assert(redis.is_error(err) and err.code == "CONNECTION")
+    assert(tostring(err):find("cannot connect", 1, true))
+end
+
+-- A server that answers the TLS greeting of the client with plain text.
+local function tls_url_test()
+    local listener <close> = network.tcp.bind("127.0.0.1", 0)
+    local _, port = listener:getsockname()
+    local serving = coroutine.detach(coroutine.create(function()
+        local sock <close> = listener:accept()
+        sock:receive(1)
+        sock:send("-ERR this server speaks plain text\r\n")
+    end))
+    local err = failure(function() redis.connect(`rediss://127.0.0.1:$port`, { tls = { verify = false }, timeout = 5 }) end)
+    assert(redis.is_error(err) and err.code == "CONNECTION")
+    assert(tostring(err):find("TLS", 1, true), tostring(err))
+    coroutine.close(serving)
+end
+
+local function close_test()
+    local env <close> = setup()
+    local server = env.server
+    do
+        local r <close> = env:connect()
+        assert(r:ping() == "PONG")
+    end
+    local r = env.clients[2]
+    local err = failure(function() r:ping() end)
+    assert(err.code == "CONNECTION" and err.message == "the client is closed")
+    r:close()
+    env.r:ping()
+    assert(server.open == 1)
+end
+
+-- Commands -----------------------------------------------------------------------
+
+local function get_set_test()
+    local env <close> = setup()
+    local r = env.r
+    assert(r:set("k", "v") == "OK")
+    assert(r:get("k") == "v")
+    assert(r:get("missing") == nil)
+    assert(r:set("n", 42) == "OK" and r:get("n") == "42")
+    assert(r:set("f", 1.5) == "OK" and r:get("f") == "1.5")
+    assert(r:set("whole", 3.0) == "OK" and r:get("whole") == "3")
+    assert(r:set("big", 123456789012345678901234567890n) == "OK" and r:get("big") == "123456789012345678901234567890")
+    assert(r:set("flag", true) == "OK" and r:get("flag") == "1")
+    assert(r:del("k", "n", "missing") == 2)
+    assert(r:exists("k") == 0)
+end
+
+local function option_tables_test()
+    local env <close> = setup()
+    local r, server from env
+    assert(r:set("k", "v", { ex = 60 }) == "OK")
+    assert(r:ttl("k") == 60)
+    server.now = server.now + 59000
+    assert(r:get("k") == "v")
+    server.now = server.now + 1000
+    assert(r:get("k") == nil)
+    assert(r:set("k", "a", { nx = true }) == "OK")
+    assert(r:set("k", "b", { nx = true, px = 1500 }) == nil)
+    assert(r:set("k", "c", { xx = true, get = true, px = 1500 }) == "a")
+    assert(r:pttl("k") == 1500)
+    -- A false flag adds nothing.
+    assert(r:set("k", "d", { nx = false }) == "OK" and r:get("k") == "d")
+end
+
+local function counters_test()
+    local env <close> = setup()
+    local r, server from env
+    assert(r:incr("visits") == 1)
+    assert(r:incr("visits") == 2)
+    assert(r:incrby("visits", 10) == 12)
+    assert(r:ttl("visits") == -1)
+    assert(r:expire("visits", 30) == 1)
+    assert(r:ttl("visits") == 30)
+    server.now = server.now + 30000
+    assert(r:ttl("visits") == -2)
+    assert(r:incr("visits") == 1)
+end
+
+local function hashes_test()
+    local env <close> = setup()
+    local r = env.r
+    assert(r:hset("user:1", "name", "Ada") == 1)
+    assert(r:hset("user:1", { age = 36, city = "London" }) == 2)
+    assert(same(r:hgetall("user:1"), { name = "Ada", age = "36", city = "London" }))
+    assert(r:hget("user:1", "age") == "36")
+    assert(same(r:hgetall("missing"), {}))
+    local values = r:hmget("user:1", "name", "nope", "city")
+    assert(values[1] == "Ada" and values[2] == nil and values[3] == "London")
+    -- An array inside a table expands in place.
+    assert(r:hdel("user:1", { "age", "city" }) == 2)
+end
+
+local function call_test()
+    local env <close> = setup()
+    local r = env.r
+    assert(r:call("SET", "k", "v") == "OK")
+    assert(r:call("get", "k") == "v")
+    assert(same(r:config_get("maxmemory"), { maxmemory = "0" }))
+    assert(r:client_setname("me") == "OK" and r:client_getname() == "me")
+    assert(r:type("k") == "string")
+    raises(function() r:call() end, "needs a name")
+    raises(function() r:get(nil) end, "argument #2 of the Redis command is nil")
+    raises(function() r:set("k", print) end, "cannot send a function value")
+    raises(function() r:set("k", { [1.5] = "x" }) end, "cannot send a table with the key")
+    raises(function() r:set("k", 0 / 0) end, "NaN")
+end
+
+local function reply_types_test()
+    local env <close> = setup()
+    local r = env.r
+    local double = r:call("FAKE", "double", "2.5")
+    assert(double == 2.5 and math.type(double) == "float")
+    local inf = r:call("FAKE", "inf")
+    assert(inf[1] == math.huge and inf[2] == -math.huge)
+    local big = r:call("FAKE", "big", "3492890328409238509324850943850943825024385")
+    assert(math.type(big) == "bigint" and big == 3492890328409238509324850943850943825024385n)
+    assert(r:call("FAKE", "true") == true and r:call("FAKE", "false") == false)
+    assert(r:call("FAKE", "verbatim", "some text") == "some text")
+    assert(same(r:call("FAKE", "set"), { a = true, b = true, [3] = true }))
+    local map = r:call("FAKE", "map")
+    assert(map.name == "Ada" and map.n == 2 and map.tags.x == true)
+    assert(same(map.nested, { k = { 1, 2 } }))
+    local nulls = r:call("FAKE", "nulls")
+    assert(nulls[1] == "a" and nulls[2] == nil and nulls[3] == "c")
+    assert(r:call("FAKE", "attr", "value") == "value")
+    -- A push message that arrives before a reply is passed over.
+    assert(r:call("FAKE", "push") == "after")
+    assert(r:ping() == "PONG")
+end
+
+local function binary_test()
+    local env <close> = setup()
+    local r = env.r
+    -- A reply that is not valid text is a vector.
+    local blob = r:call("FAKE", "bytes")
+    assert(type(blob) == "vector" and #blob == 4)
+    assert(vector.get(blob, 0) == 255 and vector.get(blob, 2) == 254)
+    -- A vector argument travels as its bytes.
+    assert(r:set("blob", blob) == "OK")
+    local back = r:get("blob")
+    assert(type(back) == "vector" and #back == 4 and vector.get(back, 3) == 1)
+    -- The length of a bulk string counts bytes.
+    local text = "h\u{e9}llo \u{1F600}"
+    assert(r:set("text", text) == "OK")
+    assert(r:get("text") == text)
+    assert(r:set("empty", "") == "OK" and r:get("empty") == "")
+end
+
+local function large_values_test()
+    local env <close> = setup()
+    local r = env.r
+    local big = r:call("FAKE", "size", 2500000)
+    assert(#big == 2500000 and big:sub(-3) == "xxx")
+    local text = string.rep("abcdefghij", 150000)
+    assert(r:set("large", text) == "OK")
+    assert(r:get("large") == text)
+    assert(r:ping() == "PONG")
+end
+
+local function errors_test()
+    local env <close> = setup()
+    local r = env.r
+    r:hset("h", "f", "v")
+    local err = failure(function() r:get("h") end)
+    assert(redis.is_error(err))
+    assert(err.code == "WRONGTYPE")
+    assert(err.message == "WRONGTYPE Operation against a key holding the wrong kind of value")
+    assert(tostring(err) == err.message)
+    err = failure(function() r:nosuchcommand("x") end)
+    assert(err.code == "ERR" and err.message:find("unknown command", 1, true))
+    err = failure(function() r:call("FAKE", "bulkerr", "SYNTAX invalid syntax") end)
+    assert(err.code == "SYNTAX")
+    assert(not redis.is_error("ERR text") and not redis.is_error({ code = "ERR" }))
+    -- An error reply leaves its connection in the pool.
+    assert(r:ping() == "PONG" and env.server.accepted == 1)
+end
+
+local function pooled_state_commands_test()
+    local env <close> = setup()
+    local r = env.r
+    raises(function() r:multi() end, "use r:transaction")
+    raises(function() r:watch("k") end, "watch option")
+    raises(function() r:select(1) end, "db option")
+end
+
+-- Pipelines ----------------------------------------------------------------------
+
+local function pipeline_test()
+    local env <close> = setup()
+    local r = env.r
+    r:set("a", "1")
+    local results = r:pipeline(function(p)
+        assert(p:get("a") == nil)
+        p:get("missing")
+        p:incr("a")
+        p:call("HSET", "h", { x = 1 })
+        p:hgetall("h")
+    end)
+    assert(results.n == 5)
+    assert(results[1] == "1" and results[2] == nil and results[3] == 2 and results[4] == 1)
+    assert(same(results[5], { x = "1" }))
+    assert(r:pipeline(function() end).n == 0)
+    assert(env.server.accepted == 1)
+end
+
+local function pipeline_errors_test()
+    local env <close> = setup()
+    local r = env.r
+    r:hset("h", "f", "v")
+    local results = r:pipeline(function(p)
+        p:set("k", "v")
+        p:incr("h")
+        p:get("k")
+    end)
+    assert(results[1] == "OK" and results[3] == "v")
+    assert(redis.is_error(results[2]) and results[2].code == "WRONGTYPE")
+    -- An error of the function sends nothing.
+    raises(function()
+        r:pipeline(function(p)
+            p:set("unsent", "1")
+            error("stop")
+        end)
+    end, "stop")
+    assert(r:exists("unsent") == 0)
+end
+
+local function pipeline_many_test()
+    local env <close> = setup()
+    local r = env.r
+    local results = r:pipeline(function(p)
+        for _ = 1, 500 do
+            p:incr("n")
+        end
+    end)
+    assert(results.n == 500 and results[500] == 500 and results[1] == 1)
+end
+
+-- Transactions -------------------------------------------------------------------
+
+local function transaction_test()
+    local env <close> = setup()
+    local r, server from env
+    local results = r:transaction(function(tx)
+        assert(tx:set("a", "1") == nil)
+        tx:incr("a")
+        tx:get("a")
+    end)
+    assert(results.n == 3 and results[1] == "OK" and results[2] == 2 and results[3] == "2")
+    assert(count(server.log, "MULTI") == 1 and count(server.log, "EXEC") == 1)
+    assert(r:transaction(function() end).n == 0)
+    assert(count(server.log, "MULTI") == 1)
+end
+
+local function transaction_errors_test()
+    local env <close> = setup()
+    local r = env.r
+    r:hset("h", "f", "v")
+    -- A command that fails while the transaction runs has its error in place.
+    local results = r:transaction(function(tx)
+        tx:set("a", "1")
+        tx:incr("h")
+        tx:get("a")
+    end)
+    assert(results[1] == "OK" and results[3] == "1")
+    assert(redis.is_error(results[2]) and results[2].code == "WRONGTYPE")
+    -- A command that the server refuses to queue cancels the transaction.
+    local err = failure(function()
+        r:transaction(function(tx)
+            tx:set("b", "1")
+            tx:nosuchcommand()
+        end)
+    end)
+    assert(redis.is_error(err) and err.message:find("unknown command", 1, true))
+    assert(r:exists("b") == 0)
+    -- An error of the function sends nothing.
+    raises(function()
+        r:transaction(function(tx)
+            tx:set("c", "1")
+            error("stop")
+        end)
+    end, "stop")
+    assert(r:exists("c") == 0 and r:ping() == "PONG")
+    assert(env.server.accepted == 1)
+end
+
+local function watch_test()
+    local env <close> = setup()
+    local r, server from env
+    r:set("balance", "100")
+    local results = r:transaction(function(tx, conn)
+        local balance = tonumber(conn:get("balance"))
+        tx:set("balance", balance - 10)
+    end, { watch = "balance" })
+    assert(results[1] == "OK" and r:get("balance") == "90")
+    -- A change of the watched key by another connection cancels the transaction.
+    local runs = 0
+    local aborted = r:transaction(function(tx, conn)
+        runs = runs + 1
+        local balance = tonumber(conn:get("balance"))
+        r:set("balance", "5")
+        tx:set("balance", balance - 10)
+    end, { watch = { "balance" } })
+    assert(aborted == nil and runs == 1 and r:get("balance") == "5")
+    -- With retries the function runs again and sees the new value.
+    runs = 0
+    results = r:transaction(function(tx, conn)
+        runs = runs + 1
+        local balance = tonumber(conn:get("balance"))
+        if runs == 1 then
+            r:incr("balance")
+        end
+        tx:set("balance", balance * 2)
+    end, { watch = { "balance" }, retries = 2 })
+    assert(runs == 2 and results[1] == "OK" and r:get("balance") == "12")
+    assert(server.accepted == 2)
+end
+
+local function watch_function_error_test()
+    local env <close> = setup()
+    local r, server from env
+    local bound
+    raises(function()
+        r:transaction(function(_, conn)
+            bound = conn
+            error("stop")
+        end, { watch = "k" })
+    end, "stop")
+    assert(count(server.log, "WATCH") == 1 and count(server.log, "UNWATCH") == 1)
+    raises(function() bound:get("k") end, "the transaction has ended")
+    -- A function that records nothing releases the keys too.
+    assert(r:transaction(function() end, { watch = "k" }).n == 0)
+    assert(count(server.log, "UNWATCH") == 2 and server.accepted == 1)
+end
+
+-- Publish and subscribe -----------------------------------------------------------
+
+-- Sends commands until `done` returns true, which gives the coroutines of
+-- the server and of the test their turns.
+local function settle(r, done)
+    for _ = 1, 200 do
+        if done() then
+            return
+        end
+        r:ping()
+    end
+    error("the condition never held")
+end
+
+-- Runs `fn` in a detached coroutine once a connection has subscribed to
+-- `name`.
+local function when_subscribed(server, field, name, fn)
+    return coroutine.detach(coroutine.create(function()
+        while not (server[field][name] and next(server[field][name])) do
+            coroutine.yield()
+        end
+        fn()
+    end))
+end
+
+local function subscribe_test(mode)
+    local env <close> = setup({ resp2 = mode == "resp2" })
+    local r, server from env
+    local publisher = when_subscribed(server, "channels", "b", function()
+        assert(r:publish("a", "one") == 1)
+        assert(r:publish("c", "nobody") == 0)
+        r:publish("b", "two")
+        r:publish("a", "stop")
+    end)
+    local seen = {}
+    for channel, message, pattern in r:subscribe("a", "b") do
+        seen[#seen + 1] = `$channel=$message`
+        assert(pattern == nil)
+        if message == "stop" then
+            break
+        end
+    end
+    assert(table.concat(seen, " ") == "a=one b=two a=stop")
+    assert(coroutine.resume(publisher))
+    -- Leaving the loop closed the connection of the subscription.
+    settle(r, function() return server.open == 1 end)
+    assert(server.accepted == 2)
+end
+local subscribe_cases = { resp3 = "resp3", resp2 = "resp2" }
+
+local function psubscribe_test()
+    local env <close> = setup()
+    local r = env.r
+    local next_message, sub = r:psubscribe("news.*")
+    assert(r:publish("news.tech", "x") == 1)
+    assert(r:publish("other", "y") == 0)
+    local channel, message, pattern = next_message(sub)
+    assert(channel == "news.tech" and message == "x" and pattern == "news.*")
+    sub:close()
+    assert(next_message(sub) == nil)
+    sub:close()
+    raises(function() r:subscribe() end, "channel expected")
+    raises(function() r:psubscribe() end, "channel expected")
+end
+
+local function subscription_changes_test()
+    local env <close> = setup()
+    local r, server from env
+    local next_message, sub = r:subscribe("a")
+    sub:subscribe("b")
+    sub:psubscribe("p.*")
+    assert(r:publish("b", "1") == 1)
+    assert(r:publish("p.x", "2") == 1)
+    -- Messages that arrive while the server confirms a change wait their turn.
+    sub:unsubscribe("a")
+    assert(r:publish("a", "lost") == 0)
+    local channel, message, pattern = next_message(sub)
+    assert(channel == "b" and message == "1" and pattern == nil)
+    channel, message, pattern = next_message(sub)
+    assert(channel == "p.x" and message == "2" and pattern == "p.*")
+    -- A subscription without a channel or a pattern ends its loop.
+    sub:punsubscribe()
+    sub:unsubscribe()
+    assert(next_message(sub) == nil)
+    assert(sub.closed)
+    local err = failure(function() sub:subscribe("z") end)
+    assert(err.code == "CONNECTION")
+    settle(r, function() return server.open == 1 end)
+end
+
+local function subscriber_coroutine_test()
+    local env <close> = setup()
+    local r = env.r
+    local got = {}
+    local held
+    local consumer = coroutine.detach(coroutine.create(function()
+        local next_message, sub = r:subscribe("jobs")
+        held = sub
+        for _, message in next_message, sub, nil, sub do
+            got[#got + 1] = message
+        end
+        return "ended"
+    end))
+    settle(r, function() return held ~= nil end)
+    r:publish("jobs", "a")
+    r:publish("jobs", "b")
+    settle(r, function() return #got == 2 end)
+    assert(got[1] == "a" and got[2] == "b")
+    -- Closing the subscription from another coroutine ends the loop.
+    held:close()
+    local ok, result = coroutine.resume(consumer)
+    assert(ok and result == "ended")
+end
+
+local function subscription_connection_lost_test()
+    local env <close> = setup()
+    local r, server from env
+    local next_message, sub = r:subscribe("a")
+    for conn in pairs(server.conns) do
+        if next(conn.channels) then
+            conn.sock:close()
+        end
+    end
+    local err = failure(function() next_message(sub) end)
+    assert(redis.is_error(err) and err.code == "CONNECTION")
+    assert(sub.closed and r:ping() == "PONG")
+end
+
+-- Scripts ------------------------------------------------------------------------
+
+local function script_test()
+    local env <close> = setup()
+    local r, server from env
+    local echo = r:script("return ARGV[1]")
+    assert(#echo.sha == 40 and echo.sha:find("^%x+$"))
+    assert(echo.source == "return ARGV[1]")
+    -- The first call finds no script on the server and loads it.
+    assert(echo({}, "hello") == "hello")
+    assert(server.loads == 1 and count(server.log, "EVALSHA") == 2)
+    assert(echo(nil, "again") == "again")
+    assert(server.loads == 1 and count(server.log, "EVALSHA") == 3)
+    assert(r:script_flush() == "OK")
+    assert(echo({}, "reloaded") == "reloaded" and server.loads == 2)
+    r:set("k", "v")
+    local get = r:script("return redis.call('GET', KEYS[1])")
+    assert(get({ "k" }) == "v" and get({ "missing" }) == nil)
+    assert(same(r:script("return {KEYS[1], ARGV[1], 7}")({ "k" }, "a"), { "k", "a", 7 }))
+    raises(function() r:script(42) end, "string expected")
+end
+
+local function script_errors_test()
+    local env <close> = setup()
+    local r = env.r
+    local err = failure(function() r:script("return redis.error_reply('MYERR boom')")() end)
+    assert(redis.is_error(err) and err.code == "MYERR" and err.message == "MYERR boom")
+    err = failure(function() r:script("this is not lua")() end)
+    assert(err.code == "ERR")
+    -- The generic methods send EVAL and EVALSHA as they are.
+    assert(r:eval("return ARGV[1]", 0, "direct") == "direct")
+    local sha = r:script("return ARGV[1]").sha
+    assert(r:evalsha(sha, 0, "by sha") == "by sha")
+    err = failure(function() r:evalsha(string.rep("0", 40), 0) end)
+    assert(err.code == "NOSCRIPT")
+    assert(#r:script_load("return redis.call('INCR', KEYS[1])") == 40)
+end
+
+-- Scans --------------------------------------------------------------------------
+
+local function scan_test()
+    local env <close> = setup()
+    local r, server from env
+    for i = 1, 7 do
+        r:set(`user:$i`, i)
+    end
+    r:set("other", "x")
+    local keys = {}
+    for key in r:scan({ match = "user:*" }) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    assert(#keys == 7 and keys[1] == "user:1" and keys[7] == "user:7")
+    assert(count(server.log, "SCAN") == 4)
+    local n = 0
+    for _ in r:scan({ count = 100 }) do
+        n = n + 1
+    end
+    assert(n == 8 and count(server.log, "SCAN") == 5)
+end
+
+local function collection_scans_test()
+    local env <close> = setup()
+    local r = env.r
+    r:sadd("s", "a", "b", "c")
+    local members = {}
+    for member in r:sscan("s") do
+        members[#members + 1] = member
+    end
+    table.sort(members)
+    assert(table.concat(members) == "abc")
+    assert(same(r:smembers("s"), { a = true, b = true, c = true }))
+    r:hset("h", { a = 1, ab = 2, b = 3, c = 4 })
+    local fields = {}
+    for field, value in r:hscan("h", { match = "a*" }) do
+        fields[field] = value
+    end
+    assert(same(fields, { a = "1", ab = "2" }))
+    fields = {}
+    for field, value in r:hscan("h") do
+        fields[field] = value
+    end
+    assert(same(fields, { a = "1", ab = "2", b = "3", c = "4" }))
+    r:zadd("z", 1, "one", 2.5, "two", 3, "three")
+    local scores = {}
+    for member, score in r:zscan("z") do
+        scores[member] = score
+    end
+    assert(same(scores, { one = 1, two = 2.5, three = 3 }))
+    assert(r:zscore("z", "two") == 2.5 and r:zscore("z", "none") == nil)
+    for _ in r:sscan("none") do
+        error("an empty set has no member")
+    end
+end
+
+-- The pool -----------------------------------------------------------------------
+
+local function pool_reuse_test()
+    local env <close> = setup()
+    local r, server from env
+    for _ = 1, 20 do
+        r:incr("n")
+    end
+    assert(server.accepted == 1 and r.size == 1 and #r.idle == 1)
+end
+
+local function pool_test(size)
+    local env <close> = setup(nil, { pool = size })
+    local r, server from env
+    local workers = {}
+    for i = 1, 12 do
+        workers[i] = coroutine.detach(coroutine.create(function()
+            for _ = 1, 5 do
+                r:incr("n")
+                assert(r:echo(`w$i`) == `w$i`)
+            end
+            return i
+        end))
+    end
+    for i = 1, 12 do
+        local ok, result = coroutine.resume(workers[i])
+        assert(ok and result == i, tostring(result))
+    end
+    assert(r:get("n") == "60")
+    assert(server.accepted <= size, `$(server.accepted) connections`)
+    assert(size == 1 or server.accepted > 1)
+    assert(r.size == server.accepted and #r.idle == r.size)
+end
+local pool_cases = { one = 1, three = 3, default = 10 }
+
+local function pool_main_waits_test()
+    local env <close> = setup(nil, { pool = 1 })
+    local r, server from env
+    local big = coroutine.detach(coroutine.create(function()
+        return #r:call("FAKE", "size", 3000000)
+    end))
+    -- A turn of the scheduler starts the coroutine, which takes the only
+    -- connection.
+    coroutine.resume(coroutine.detach(coroutine.create(function() coroutine.yield() end)))
+    assert(#r.idle == 0)
+    assert(r:ping() == "PONG")
+    local ok, size = coroutine.resume(big)
+    assert(ok and size == 3000000)
+    assert(server.accepted == 1)
+end
+
+local function broken_connection_test()
+    local env <close> = setup()
+    local r, server from env
+    local err = failure(function() r:call("FAKE", "close") end)
+    assert(redis.is_error(err) and err.code == "CONNECTION")
+    assert(r.size == 0)
+    assert(r:ping() == "PONG")
+    assert(server.accepted == 2 and r.size == 1)
+    err = failure(function() r:call("FAKE", "garbage") end)
+    assert(err.code == "PROTOCOL" and err.message:find("unknown type '?'", 1, true))
+    assert(r:ping() == "PONG" and server.accepted == 3 and r.size == 1)
+end
+
+local function timeout_test()
+    local env <close> = setup(nil, { timeout = 0.05 })
+    local r, server from env
+    raises(function() r:call("FAKE", "silent") end, "receive timeout")
+    -- The connection with a reply still on its way is closed.
+    assert(r.size == 0)
+    assert(r:ping() == "PONG" and server.accepted == 2)
+end
+
+local function cancelled_command_test()
+    local env <close> = setup(nil, { pool = 2 })
+    local r = env.r
+    local stuck = coroutine.detach(coroutine.create(function() r:call("FAKE", "silent") end))
+    settle(r, function() return r.size == 2 end)
+    coroutine.close(stuck)
+    -- The pool drops the connection that still waits for a reply.
+    assert(r.size == 1)
+    assert(r:ping() == "PONG")
+end
+
+-- RESP2 --------------------------------------------------------------------------
+
+local function resp2_fallback_test()
+    local env <close> = setup({ resp2 = true })
+    local r = env.r
+    assert(r.resp == 2)
+    r:hset("h", { a = 1, b = 2 })
+    assert(same(r:hgetall("h"), { a = "1", b = "2" }))
+    assert(same(r:hgetall("missing"), {}))
+    assert(r:get("missing") == nil)
+    r:sadd("s", "x", "y")
+    assert(same(r:smembers("s"), { x = true, y = true }))
+    r:zadd("z", 1.5, "m")
+    assert(r:zscore("z", "m") == 1.5 and r:zscore("z", "none") == nil)
+    assert(same(r:config_get("maxmemory"), { maxmemory = "0" }))
+    assert(same(r:call("hgetall", "h"), { a = "1", b = "2" }))
+    local values = r:mget("missing", "also")
+    assert(values[1] == nil and values[2] == nil)
+    r:set("k", "v")
+    local results = r:pipeline(function(p)
+        p:hgetall("h")
+        p:smembers("s")
+        p:get("k")
+    end)
+    assert(same(results[1], { a = "1", b = "2" }) and results[2].x == true and results[3] == "v")
+    results = r:transaction(function(tx)
+        tx:hgetall("h")
+        tx:incr("n")
+    end)
+    assert(same(results[1], { a = "1", b = "2" }) and results[2] == 1)
+    assert(r:transaction(function(tx)
+        r:set("k", "changed")
+        tx:get("k")
+    end, { watch = "k" }) == nil)
+end
+
+local function resp2_auth_test()
+    local env <close> = setup({ resp2 = true, password = "pw" }, { password = "pw" })
+    assert(env.r.resp == 2 and env.r:ping() == "PONG")
+    local err = failure(function() env:connect({ password = "wrong" }) end)
+    assert(err.code == "WRONGPASS")
+    local named <close> = setup({ resp2 = true, password = "pw", username = "app" }, { password = "pw", username = "app" })
+    assert(named.r:ping() == "PONG")
+end
+
+local function protocol_option_test()
+    local env <close> = setup({ password = "pw" }, { protocol = 2, password = "pw", client_name = "old" })
+    local r = env.r
+    assert(r.resp == 2)
+    r:hset("h", "f", "v")
+    assert(same(r:hgetall("h"), { f = "v" }))
+    assert(r:client_getname() == "old")
+end
+
+-- The store of rate_limit ----------------------------------------------------------
+
+local rate_limit = require("rate_limit")
+local web = require("web")
+
+-- A clock that moves the clock of the fake server along.
+local function shared_clock(server)
+    local clock = { t = 1000000 }
+    clock.now = function() return clock.t end
+    function clock:advance(seconds)
+        self.t = self.t + seconds
+        server.now = server.now + math.floor(seconds * 1000)
+    end
+    return clock
+end
+
+local function rate_store_test()
+    local env <close> = setup()
+    local r, server from env
+    local clock = shared_clock(server)
+    local store = redis.rate_limit_store(r)
+    local n, reset = store:incr("a", 10)
+    assert(n == 1 and reset == 10)
+    clock:advance(4)
+    n, reset = store:incr("a", 10)
+    assert(n == 2 and reset == 6)
+    assert(store:incr("a", 10, 5) == 7)
+    assert(store:incr("a", 10, -2.5) == 4.5)
+    clock:advance(6)
+    n, reset = store:incr("a", 10)
+    assert(n == 1 and reset == 10)
+    assert(server.dbs[0]["rate_limit:a"] ~= nil)
+    assert(store:get("missing") == nil)
+    store:set("b", 1234.5, 2)
+    assert(store:get("b") == 1234.5)
+    clock:advance(2)
+    assert(store:get("b") == nil)
+    -- The scripts load once.
+    assert(server.loads == 1)
+    local other = redis.rate_limit_store(r, { prefix = "api:" })
+    assert(other:incr("a", 10) == 1 and server.dbs[0]["api:a"] ~= nil)
+    assert(server.loads == 1)
+end
+
+local function rate_store_take_test()
+    local env <close> = setup()
+    local r, server from env
+    local clock = shared_clock(server)
+    local store = redis.rate_limit_store(r)
+    local allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(allowed == true and full_in == 2)
+    allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(allowed == false and full_in == 2)
+    assert(store:get("k") == clock.t + 2)
+    clock:advance(1)
+    allowed, full_in = store:take("k", 2, 1, 3, clock.t)
+    assert(allowed == true and full_in == 3)
+    -- The key lives until the bucket is full again.
+    assert(r:pttl("rate_limit:k") == 3000)
+    allowed, full_in = store:take("fraction", 1, 0.25, 2, clock.t + 0.125)
+    assert(allowed and full_in == 0.25)
+end
+
+local function limiter_on(env, options)
+    local clock = shared_clock(env.server)
+    options.now = clock.now
+    options.store = redis.rate_limit_store(env.r)
+    return rate_limit.new(options), clock
+end
+
+local function rate_fixed_window_test()
+    local env <close> = setup()
+    local limiter, clock = limiter_on(env, { max = 3, window = 10 })
+    for i = 1, 3 do
+        local allowed, info = limiter:check("a")
+        assert(allowed)
+        assert(info.limit == 3 and info.remaining == 3 - i and info.reset == 10)
+        assert(info.retry_after == nil)
+    end
+    clock:advance(4)
+    local allowed, info = limiter:check("a")
+    assert(not allowed)
+    assert(info.remaining == 0 and info.reset == 6 and info.retry_after == 6)
+    assert(limiter:check("b"))
+    clock:advance(6)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 2)
+end
+
+local function rate_sliding_window_test()
+    local env <close> = setup()
+    local limiter, clock = limiter_on(env, { max = 10, window = 10, algorithm = "sliding" })
+    for i = 1, 10 do
+        local allowed, info = limiter:check("a")
+        assert(allowed and info.remaining == 10 - i)
+    end
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.remaining == 0)
+    assert(info.retry_after == 10 and info.reset == 10)
+    clock:advance(15)
+    for _ = 1, 5 do
+        assert(limiter:check("a"))
+    end
+    allowed, info = limiter:check("a")
+    assert(not allowed)
+    assert(info.retry_after == 1)
+    clock:advance(1)
+    assert(limiter:check("a"))
+end
+
+local function rate_bucket_test()
+    local env <close> = setup()
+    local limiter, clock = limiter_on(env, { max = 10, window = 10, algorithm = "bucket", burst = 3 })
+    for i = 1, 3 do
+        local allowed, info = limiter:check("a")
+        assert(allowed and info.limit == 3 and info.remaining == 3 - i)
+    end
+    local allowed, info = limiter:check("a")
+    assert(not allowed and info.remaining == 0 and info.retry_after == 1)
+    clock:advance(1)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 0)
+    assert(not limiter:check("a"))
+    clock:advance(2)
+    assert(limiter:check("a"))
+    assert(limiter:check("a"))
+    assert(not limiter:check("a"))
+    clock:advance(1000)
+    allowed, info = limiter:check("a")
+    assert(allowed and info.remaining == 2)
+    -- The limiter takes tokens with the script and never with GET and SET.
+    assert(count(env.server.log, "EVALSHA") > 0)
+    assert(env.server.script_calls > 0 and count(env.server.log, "GET") == 0)
+end
+
+-- Requests that arrive together each take a token of their own.
+local function rate_bucket_concurrent_test()
+    local env <close> = setup(nil, { pool = 4 })
+    local limiter = limiter_on(env, { max = 10, window = 10, algorithm = "bucket", burst = 5 })
+    limiter:check("warm")
+    local allowed = 0
+    local requests = {}
+    local function request()
+        if limiter:check("k") then
+            allowed = allowed + 1
+        end
+    end
+    for i = 1, 20 do
+        requests[i] = coroutine.detach(coroutine.create(request))
+    end
+    for i = 1, 20 do
+        assert(coroutine.resume(requests[i]))
+    end
+    assert(allowed == 5, `$allowed requests passed`)
+end
+
+local function rate_web_test()
+    local env <close> = setup()
+    local clock = shared_clock(env.server)
+    local app = web.app({ log = function() end })
+    app:register(rate_limit, { max = 2, window = 60, now = clock.now, store = redis.rate_limit_store(env.r) })
+    app:get("/", function() return { ok = true } end)
+    local res = app:inject({ path = "/" })
+    assert(res.status == 200 and res.headers["ratelimit-remaining"] == "1")
+    assert(res.headers["ratelimit-reset"] == "60")
+    app:inject({ path = "/" })
+    clock:advance(20)
+    res = app:inject({ path = "/" })
+    assert(res.status == 429 and res.headers["retry-after"] == "40")
+    clock:advance(40)
+    assert(app:inject({ path = "/" }).status == 200)
+end
+
+-- The store of session -------------------------------------------------------------
+
+local session = require("session")
+
+local function sid_of(res)
+    local set = res.headers["set-cookie"]
+    if set == nil then
+        return nil
+    end
+    for _, line in ipairs(type(set) == "table" and set or { set }) do
+        if pair = line:match("^(sid=[^;]*)") then
+            return pair
+        end
+    end
+    return nil
+end
+
+local function session_app(env, options)
+    local app = web.app()
+    options = options or {}
+    options.secret = "test secret"
+    options.store = redis.session_store(env.r, options.store_options)
+    options.store_options = nil
+    app:register(session, options)
+    app:post("/login", function(req)
+        session.regenerate(req)
+        req.session.user = "ada"
+        return 204
+    end)
+    app:get("/me", function(req) return { user = req.session.user, visits = req.session.visits } end)
+    app:post("/visit", function(req)
+        req.session.visits = (req.session.visits or 0) + 1
+        return { visits = req.session.visits }
+    end)
+    app:post("/logout", function(req)
+        session.destroy(req)
+        return 204
+    end)
+    return app
+end
+
+local function session_store_test()
+    local env <close> = setup()
+    local r, server from env
+    local store = redis.session_store(r)
+    assert(store:get("none") == nil)
+    store:set("abc", { user = "ada", roles = { "admin", "dev" } }, 60)
+    assert(same(store:get("abc"), { user = "ada", roles = { "admin", "dev" } }))
+    assert(r:ttl("session:abc") == 60)
+    server.now = server.now + 59000
+    assert(store:get("abc").user == "ada")
+    server.now = server.now + 1000
+    assert(store:get("abc") == nil)
+    store:set("abc", { n = 1 }, 60)
+    store:destroy("abc")
+    store:destroy("abc")
+    assert(store:get("abc") == nil and r:dbsize() == 0)
+end
+
+local function session_requests_test()
+    local env <close> = setup()
+    local r, server from env
+    local app = session_app(env)
+    local pair = sid_of(app:inject({ method = "POST", path = "/login" }))
+    assert(pair, "a session cookie")
+    assert(r:dbsize() == 1)
+    local key = next(server.dbs[0])
+    assert(key:find("^session:") and r:ttl(key) == 86400)
+    assert(app:inject({ path = "/me", headers = { Cookie = pair } }):json().user == "ada")
+    local res = app:inject({ method = "POST", path = "/visit", headers = { Cookie = pair } })
+    assert(res:json().visits == 1)
+    res = app:inject({ method = "POST", path = "/visit", headers = { Cookie = pair } })
+    assert(res:json().visits == 2)
+    local me = app:inject({ path = "/me", headers = { Cookie = pair } }):json()
+    assert(me.user == "ada" and me.visits == 2)
+    -- A request without the cookie has a session of its own.
+    assert(app:inject({ path = "/me" }):json().user == nil)
+    assert(app:inject({ method = "POST", path = "/logout", headers = { Cookie = pair } }).status == 204)
+    assert(r:dbsize() == 0)
+    assert(app:inject({ path = "/me", headers = { Cookie = pair } }):json().user == nil)
+end
+
+local function session_expiry_test()
+    local env <close> = setup()
+    local r, server from env
+    local app = session_app(env, { ttl = 120, store_options = { prefix = "sess:" } })
+    local pair = sid_of(app:inject({ method = "POST", path = "/login" }))
+    assert(next(server.dbs[0]):find("^sess:"))
+    server.now = server.now + 119000
+    assert(app:inject({ path = "/me", headers = { Cookie = pair } }):json().user == "ada")
+    server.now = server.now + 1000
+    assert(app:inject({ path = "/me", headers = { Cookie = pair } }):json().user == nil)
+    assert(r:dbsize() == 0)
+end
+
+-- A handler inside a detached coroutine reads its session while others run.
+local function session_concurrent_test()
+    local env <close> = setup(nil, { pool = 3 })
+    local app = session_app(env)
+    local requests = {}
+    local function visit_twice()
+        local pair = sid_of(app:inject({ method = "POST", path = "/visit" }))
+        local res = app:inject({ method = "POST", path = "/visit", headers = { Cookie = pair } })
+        return res:json().visits
+    end
+    for i = 1, 8 do
+        requests[i] = coroutine.detach(coroutine.create(visit_twice))
+    end
+    for i = 1, 8 do
+        local ok, visits = coroutine.resume(requests[i])
+        assert(ok and visits == 2, tostring(visits))
+    end
+    assert(env.r:dbsize() == 8)
+end
+
+-- The store of queue ---------------------------------------------------------------
+
+local queue = require("queue")
+
+-- A clock that the test moves by hand.
+local function fake_time(start)
+    local state = { now = start or 1000 }
+    state.clock = function() return state.now end
+    state.sleep = function(seconds) state.now = state.now + seconds end
+    return state
+end
+
+local function open_queue(env, options)
+    local f = fake_time()
+    options = options or {}
+    options.store = redis.queue_store(env.r)
+    options.clock = f.clock
+    options.sleep = f.sleep
+    return queue.new("jobs", options), f
+end
+
+local function queue_add_and_drain_test(mode)
+    local env <close> = setup({ resp2 = mode == "resp2" })
+    local q <close> = open_queue(env)
+    local seen = {}
+    local id, created = q:add({ to = "ada@example.com", tags = { "a", "b" } })
+    assert(type(id) == "string" and #id == 26 and created == true)
+    q:add("text")
+    q:add(42)
+    assert(same(q:stats(), { waiting = 3, delayed = 0, active = 0, completed = 0, failed = 0 }))
+    local n = q:drain(function(job)
+        seen[#seen + 1] = job
+        assert(q:stats().active == 1)
+    end)
+    assert(n == 3)
+    assert(seen[1].id == id and seen[1].name == "jobs" and seen[1].attempts == 1 and seen[1].max_attempts == 3)
+    assert(seen[1].priority == 0 and seen[1].created_at == 1000)
+    assert(same(seen[1].data, { to = "ada@example.com", tags = { "a", "b" } }))
+    assert(seen[2].data == "text" and seen[3].data == 42)
+    assert(same(q:stats(), { waiting = 0, delayed = 0, active = 0, completed = 3, failed = 0 }))
+    assert(q:drain(function() error("no job is due") end) == 0)
+    local job = q:get(id)
+    assert(job.status == "completed" and job.attempts == 1 and job.finished_at == 1000 and job.error == nil)
+end
+local queue_add_and_drain_cases = { resp3 = "resp3", resp2 = "resp2" }
+
+local function queue_delay_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env)
+    local seen = {}
+    local function handler(job) seen[#seen + 1] = job.data end
+    q:add("later", { delay = 60 })
+    q:add("soon", { delay = 10 })
+    q:add("now")
+    assert(same(q:stats(), { waiting = 1, delayed = 2, active = 0, completed = 0, failed = 0 }))
+    assert(q:drain(handler) == 1)
+    f.now = f.now + 9.999
+    assert(q:drain(handler) == 0)
+    f.now = f.now + 0.001
+    assert(q:drain(handler) == 1)
+    f.now = f.now + 50
+    assert(q:drain(handler) == 1)
+    assert(table.concat(seen, ",") == "now,soon,later")
+end
+
+local function queue_priority_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env)
+    local seen = {}
+    q:add("low-1")
+    q:add("high-1", { priority = 10 })
+    q:add("low-2")
+    q:add("high-2", { priority = 10 })
+    q:add("negative", { priority = -1 })
+    q:add("high-late", { priority = 10, delay = 5 })
+    q:drain(function(job) seen[#seen + 1] = job.data end)
+    assert(table.concat(seen, ",") == "high-1,high-2,low-1,low-2,negative")
+    f.now = f.now + 5
+    q:add("low-3")
+    q:drain(function(job) seen[#seen + 1] = job.data end)
+    assert(seen[6] == "high-late" and seen[7] == "low-3")
+end
+
+local function queue_idempotent_id_test()
+    local env <close> = setup()
+    local q <close> = open_queue(env)
+    local id, created = q:add({ n = 1 }, { id = "invoice-7" })
+    assert(id == "invoice-7" and created == true)
+    id, created = q:add({ n = 2 }, { id = "invoice-7" })
+    assert(id == "invoice-7" and created == false)
+    assert(q:stats().waiting == 1)
+    local data
+    assert(q:drain(function(job) data = job.data end) == 1)
+    assert(data.n == 1)
+    assert(select(2, q:add({ n = 3 }, { id = "invoice-7" })) == false)
+    assert(q:clean() == 1)
+    assert(select(2, q:add({ n = 4 }, { id = "invoice-7" })) == true)
+    assert(q:add("x", { id = 99 }) == "99")
+end
+
+local function queue_retry_backoff_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env, { attempts = 4, backoff = 2 })
+    local attempts = {}
+    local function handler(job)
+        attempts[#attempts + 1] = `$(job.attempts)@$(f.now)`
+        if job.attempts < 4 then
+            error("try again", 0)
+        end
+    end
+    local id = q:add("flaky")
+    assert(q:drain(handler) == 1)
+    local job = q:get(id)
+    assert(job.status == "waiting" and job.attempts == 1 and job.error == "try again" and job.run_at == 1002)
+    assert(same(q:stats(), { waiting = 0, delayed = 1, active = 0, completed = 0, failed = 0 }))
+    f.now = 1001
+    assert(q:drain(handler) == 0)
+    f.now = 1002
+    assert(q:drain(handler) == 1)
+    f.now = 1005
+    assert(q:drain(handler) == 0)
+    f.now = 1006
+    assert(q:drain(handler) == 1)
+    f.now = 1014
+    assert(q:drain(handler) == 1)
+    assert(table.concat(attempts, " ") == "1@1000 2@1002 3@1006 4@1014")
+    job = q:get(id)
+    assert(job.status == "completed" and job.attempts == 4 and job.finished_at == 1014)
+    assert(job.error == "try again")
+end
+
+local function queue_failed_and_retry_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env, { attempts = 1 })
+    local a = q:add("a")
+    q:add("b")
+    q:add("c")
+    q:drain(function(job)
+        if job.data ~= "c" then
+            error("down", 0)
+        end
+    end)
+    assert(q:stats().failed == 2 and q:stats().completed == 1)
+    local failed = q:get(a)
+    assert(failed.status == "failed" and failed.attempts == 1 and failed.finished_at == 1000)
+    f.now = f.now + 100
+    assert(q:drain(function() error("a failed job never runs") end) == 0)
+    assert(q:retry_failed() == 2)
+    assert(same(q:stats(), { waiting = 2, delayed = 0, active = 0, completed = 1, failed = 0 }))
+    local job = q:get(a)
+    assert(job.status == "waiting" and job.attempts == 0 and job.error == "down" and job.finished_at == nil)
+    local seen = {}
+    assert(q:drain(function(j) seen[#seen + 1] = j.data .. j.attempts end) == 2)
+    assert(table.concat(seen, ",") == "a1,b1")
+    assert(q:retry_failed() == 0)
+end
+
+local function queue_clean_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env, { attempts = 1 })
+    q:add("old-ok")
+    q:add("old-bad")
+    q:drain(function(job)
+        if job.data == "old-bad" then
+            error("bad", 0)
+        end
+    end)
+    f.now = f.now + 100
+    q:add("new-ok")
+    q:add("pending", { delay = 1000 })
+    q:drain(function() end)
+    assert(q:clean("completed", 50) == 1)
+    assert(q:stats().completed == 1)
+    assert(q:clean("failed", 200) == 0)
+    assert(q:clean("failed") == 1)
+    assert(q:clean() == 1)
+    assert(same(q:stats(), { waiting = 0, delayed = 1, active = 0, completed = 0, failed = 0 }))
+    -- Only the pending job and the counter of the queue remain.
+    assert(env.r:dbsize() == 3)
+end
+
+local function queue_remove_on_complete_test()
+    local env <close> = setup()
+    local q <close> = open_queue(env, { remove_on_complete = true })
+    local id = q:add("x")
+    q:drain(function() end)
+    assert(q:get(id) == nil)
+    assert(q:stats().completed == 0)
+    assert(q:get("missing") == nil)
+end
+
+local function queues_share_a_store_test()
+    local env <close> = setup()
+    local store = redis.queue_store(env.r, { prefix = "work:" })
+    local f = fake_time()
+    local a = queue.new("a", { store = store, clock = f.clock })
+    local b = queue.new("b", { store = store, clock = f.clock })
+    a:add("for-a", { id = "same" })
+    assert(select(2, b:add("for-b", { id = "same" })) == true)
+    local seen = {}
+    assert(b:drain(function(job) seen[#seen + 1] = `$(job.name):$(job.data)` end) == 1)
+    assert(a:stats().waiting == 1 and b:stats().completed == 1)
+    assert(a:drain(function(job) seen[#seen + 1] = `$(job.name):$(job.data)` end) == 1)
+    assert(table.concat(seen, ",") == "b:for-b,a:for-a")
+    a:close()
+    b:close()
+    -- Closing a queue leaves the client of its store open.
+    assert(store:stats("a", 0).completed == 1)
+    assert(env.server.dbs[0]["work:{a}:job:same"] ~= nil)
+    store:close()
+    assert(env.r:ping() == "PONG")
+end
+
+-- A job whose worker died stays active until its lease ends, then runs again.
+local function queue_lease_test()
+    local env <close> = setup()
+    local store = redis.queue_store(env.r)
+    local f = fake_time()
+    local q = queue.new("jobs", { store = store, clock = f.clock, lease = 30, attempts = 2 })
+    local id = q:add("x")
+    local first = store:claim("jobs", 1000000, 1030000)
+    assert(first.id == id and first.attempts == 1)
+    assert(store:claim("jobs", 1000000, 1030000) == nil)
+    assert(q:get(id).status == "active" and q:get(id).run_at == 1030)
+    assert(store:next_at("jobs") == 1030000)
+    f.now = 1029
+    assert(q:drain(function() end) == 0)
+    f.now = 1030
+    local attempts
+    assert(q:drain(function(job) attempts = job.attempts end) == 1)
+    assert(attempts == 2 and q:get(id).status == "completed")
+    -- The first worker lost the job, so its late answers change nothing.
+    assert(store:complete("jobs", id, 1, 1031000, true) == false)
+    assert(store:fail("jobs", id, 1, "late", 1031000, nil) == false)
+    assert(q:get(id).status == "completed" and q:get(id).error == nil)
+    -- A job that stalls in its last attempt fails.
+    local id2 = q:add("y", { attempts = 1 })
+    assert(store:claim("jobs", 1030000, 1060000).id == id2)
+    f.now = 1061
+    assert(q:drain(function() error("never runs") end) == 0)
+    assert(q:get(id2).status == "failed" and q:get(id2).error == "the job stalled in its last attempt")
+    q:close()
+end
+
+local function queue_store_claim_order_test()
+    local env <close> = setup()
+    local store = redis.queue_store(env.r)
+    local function job(id, priority, run_at)
+        return { id = id, data = "null", priority = priority, max_attempts = 1, run_at = run_at, created_at = 0 }
+    end
+    assert(store:next_at("q") == nil)
+    assert(store:add("q", job("late", 0, 500)) == true)
+    assert(store:add("q", job("early", 0, 100)) == true)
+    assert(store:add("q", job("urgent", 5, 400)) == true)
+    assert(store:add("q", job("early", 9, 0)) == false)
+    assert(store:next_at("q") == 100)
+    assert(store:claim("q", 99, 1000) == nil)
+    local urgent = store:claim("q", 450, 9000)
+    assert(same(urgent, { id = "urgent", data = "null", attempts = 1, max_attempts = 1, priority = 5, created_at = 0 }))
+    assert(store:claim("q", 450, 9000).id == "early")
+    assert(store:claim("q", 450, 9000) == nil)
+    assert(store:claim("q", 500, 9000).id == "late")
+    assert(same(store:stats("q", 500), { waiting = 0, delayed = 0, active = 3, completed = 0, failed = 0 }))
+    assert(store:fail("q", "late", 1, "oops", 600, 700) == true)
+    assert(store:get("q", "late").status == "waiting" and store:get("q", "late").last_error == "oops")
+    assert(store:next_at("q") == 700)
+    assert(store:complete("q", "urgent", 1, 600, false) == true)
+    assert(store:complete("q", "urgent", 1, 600, false) == false)
+    assert(store:get("q", "urgent").finished_at == 600)
+    assert(store:get("q", "urgent").seq == nil)
+    assert(store:clean("q", "completed", 599) == 0 and store:clean("q", "completed", 600) == 1)
+    assert(store:clean("q", "waiting", 10000) == 0)
+    assert(store:get("q", "urgent") == nil)
+end
+
+-- A job whose lease ran out stays active, and its first worker may still
+-- finish it, until another worker claims it.
+local function queue_stale_lease_test()
+    local env <close> = setup()
+    local store = redis.queue_store(env.r)
+    local function job(id, priority)
+        return { id = id, data = "null", priority = priority, max_attempts = 3, run_at = 0, created_at = 0 }
+    end
+    store:add("q", job("a", 0))
+    store:add("q", job("b", 1))
+    store:add("q", job("c", 0))
+    assert(store:claim("q", 10, 100).id == "b")
+    assert(store:claim("q", 10, 100).id == "a")
+    -- Both leases ran out. The claim takes `b` again and leaves `a` due.
+    local again = store:claim("q", 200, 300)
+    assert(again.id == "b" and again.attempts == 2)
+    assert(same(store:stats("q", 200), { waiting = 1, delayed = 0, active = 2, completed = 0, failed = 0 }))
+    assert(store:get("q", "a").status == "active")
+    assert(store:next_at("q") == 0)
+    -- The first worker of `a` finishes late, before anyone claimed the job again.
+    assert(store:complete("q", "a", 1, 210, false) == true)
+    assert(same(store:stats("q", 210), { waiting = 1, delayed = 0, active = 1, completed = 1, failed = 0 }))
+    assert(store:claim("q", 210, 300).id == "c")
+    assert(store:claim("q", 210, 300) == nil)
+    -- The first worker of `b` lost the job to the second.
+    assert(store:fail("q", "b", 1, "late", 220, 500) == false)
+    assert(store:fail("q", "b", 2, "again", 220, 500) == true)
+    assert(same(store:stats("q", 220), { waiting = 0, delayed = 1, active = 1, completed = 1, failed = 0 }))
+    assert(store:next_at("q") == 300)
+end
+
+local function queue_many_jobs_test()
+    local env <close> = setup()
+    local q <close>, f = open_queue(env)
+    for i = 1, 120 do
+        q:add(i, { priority = i % 3, delay = i % 2 })
+    end
+    local seen = {}
+    assert(q:drain(function(job) seen[#seen + 1] = job.data end) == 60)
+    f.now = f.now + 1
+    assert(q:drain(function(job) seen[#seen + 1] = job.data end) == 60)
+    -- The even numbers were due first, by falling priority, then in the order of adding.
+    assert(seen[1] == 2 and seen[2] == 8 and seen[21] == 4 and seen[41] == 6 and seen[61] == 5)
+    local marks = {}
+    for _, v in ipairs(seen) do
+        assert(not marks[v])
+        marks[v] = true
+    end
+end
+
+-- Workers that claim at the same time never receive the same job.
+local function queue_concurrent_claims_test()
+    local env <close> = setup(nil, { pool = 4 })
+    local store = redis.queue_store(env.r)
+    for i = 1, 40 do
+        store:add("q", { id = `job-$i`, data = "null", priority = 0, max_attempts = 1, run_at = 0, created_at = 0 })
+    end
+    local taken, total = {}, 0
+    local workers = {}
+    local function work()
+        while true do
+            local job = store:claim("q", 10, 1000)
+            if job == nil then
+                return
+            end
+            assert(not taken[job.id], job.id)
+            taken[job.id] = true
+            total = total + 1
+            assert(store:complete("q", job.id, job.attempts, 20, false))
+        end
+    end
+    for w = 1, 6 do
+        workers[w] = coroutine.detach(coroutine.create(work))
+    end
+    for w = 1, 6 do
+        assert(coroutine.resume(workers[w]))
+    end
+    assert(total == 40 and store:stats("q", 20).completed == 40)
+end
+
+-- Workers of `q:process` run jobs from the Redis store.
+local function queue_process_test()
+    local env <close> = setup(nil, { pool = 4 })
+    local done = {}
+    local q
+    q = queue.new("jobs", {
+        store = redis.queue_store(env.r),
+        concurrency = 3,
+        sleep = function() env.r:ping() end,
+    })
+    for i = 1, 9 do
+        q:add(i)
+    end
+    q:process(function(job)
+        env.r:incr("handled")
+        done[#done + 1] = job.data
+    end)
+    settle(env.r, function() return #done == 9 end)
+    q:close()
+    assert(env.r:get("handled") == "9" and q:stats().completed == 9)
+end
+
+-- A real server --------------------------------------------------------------------
+
+-- The last tests run when LUS_TEST_REDIS holds the URL of a Redis or
+-- Valkey server, such as redis://127.0.0.1:6379/15. They write keys that
+-- start with `atmos-test:` and delete them.
+
+local function real()
+    local ok, url = catch os.getenv("LUS_TEST_REDIS")
+    if not ok or url == nil or url == "" then
+        skip("LUS_TEST_REDIS is not set")
+    end
+    local r = redis.connect(url)
+    for key in r:scan({ match = "atmos-test:*", count = 1000 }) do
+        r:del(key)
+    end
+    return r
+end
+
+local function real_commands_test()
+    local r <close> = real()
+    assert(r:set("atmos-test:k", "v", { ex = 60 }) == "OK")
+    assert(r:get("atmos-test:k") == "v" and r:ttl("atmos-test:k") > 0)
+    r:hset("atmos-test:h", { a = 1, b = 2 })
+    assert(same(r:hgetall("atmos-test:h"), { a = "1", b = "2" }))
+    r:sadd("atmos-test:s", "x", "y")
+    assert(same(r:smembers("atmos-test:s"), { x = true, y = true }))
+    r:zadd("atmos-test:z", 1.5, "m")
+    assert(r:zscore("atmos-test:z", "m") == 1.5)
+    local results = r:pipeline(function(p)
+        p:incr("atmos-test:n")
+        p:incr("atmos-test:h")
+    end)
+    assert(results[1] == 1 and redis.is_error(results[2]) and results[2].code == "WRONGTYPE")
+    results = r:transaction(function(tx, conn)
+        tx:set("atmos-test:n", tonumber(conn:get("atmos-test:n")) + 1)
+    end, { watch = "atmos-test:n" })
+    assert(results[1] == "OK" and r:get("atmos-test:n") == "2")
+    local echo = r:script("return ARGV[1]")
+    assert(echo({}, "x") == "x")
+    local next_message, sub = r:subscribe("atmos-test:channel")
+    r:publish("atmos-test:channel", "hello")
+    local channel, message = next_message(sub)
+    assert(channel == "atmos-test:channel" and message == "hello")
+    sub:close()
+end
+
+local function real_stores_test()
+    local r <close> = real()
+    local rates = redis.rate_limit_store(r, { prefix = "atmos-test:rate:" })
+    local n, reset = rates:incr("a", 10)
+    assert(n == 1 and reset > 9 and reset <= 10)
+    assert(rates:incr("a", 10, 2.5) == 3.5)
+    local allowed, full_in = rates:take("k", 2, 1, 3, 1000)
+    assert(allowed == true and full_in == 2)
+    allowed, full_in = rates:take("k", 2, 1, 3, 1000)
+    assert(allowed == false and full_in == 2)
+    assert(rates:get("k") == 1002)
+    local sessions = redis.session_store(r, { prefix = "atmos-test:session:" })
+    sessions:set("id", { user = "ada" }, 60)
+    assert(sessions:get("id").user == "ada")
+    sessions:destroy("id")
+    assert(sessions:get("id") == nil)
+    local store = redis.queue_store(r, { prefix = "atmos-test:queue:" })
+    local function job(id, priority, run_at)
+        return { id = id, data = "null", priority = priority, max_attempts = 2, run_at = run_at, created_at = 0 }
+    end
+    assert(store:next_at("q") == nil)
+    assert(store:add("q", job("late", 0, 500)) and store:add("q", job("early", 0, 100)))
+    assert(store:add("q", job("urgent", 5, 400)) and not store:add("q", job("early", 9, 0)))
+    assert(store:next_at("q") == 100)
+    assert(store:claim("q", 99, 1000) == nil)
+    assert(store:claim("q", 450, 9000).id == "urgent")
+    assert(store:claim("q", 450, 9000).id == "early")
+    assert(store:claim("q", 500, 9000).id == "late")
+    assert(same(store:stats("q", 500), { waiting = 0, delayed = 0, active = 3, completed = 0, failed = 0 }))
+    assert(store:fail("q", "late", 1, "oops", 600, 700) == true)
+    assert(store:get("q", "late").last_error == "oops" and store:next_at("q") == 700)
+    assert(store:complete("q", "urgent", 1, 600, false) == true)
+    assert(store:complete("q", "urgent", 1, 600, false) == false)
+    assert(store:fail("q", "early", 1, "gone", 650, nil) == true)
+    assert(store:retry_failed("q", 660) == 1)
+    assert(store:claim("q", 9500, 9900).attempts == 1)
+    assert(store:clean("q", "completed", 600) == 1)
+    for key in r:scan({ match = "atmos-test:*", count = 1000 }) do
+        r:del(key)
+    end
+end
