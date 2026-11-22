@@ -831,7 +831,7 @@ function Client:call(...)
         error(value, 0)
     end
     if conn.resp == 2 then
-        value = reshape(flat, value)
+        return reshape(flat, value)
     end
     return value
 end
