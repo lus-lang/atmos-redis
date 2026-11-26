@@ -7,6 +7,28 @@
 --- `r:config_get("maxmemory")`. `r:call` sends a command whose name is
 --- chosen at run time.
 ---
+--- The following example sets a key that expires, sends two commands in one
+--- write, and prints the messages of a channel.
+---
+--- ```lus nocheck
+--- local redis = require("https://atmosp.here/2.0/redis.lus")
+---
+--- local r = redis.connect("redis://localhost:6379")
+--- r:set("visits", 0, { ex = 60 })
+--- print(r:incr("visits"))  --> 1
+---
+--- local replies = r:pipeline(function(p)
+---     p:get("visits")
+---     p:hgetall("user:1")
+--- end)
+---
+--- print(replies[1])  --> 1
+---
+--- for channel, message in r:subscribe("news") do
+---     print(channel, message)
+--- end
+--- ```
+---
 --- An argument is a string, a number, a boolean, a vector, or a table. A
 --- number is sent as its text, a boolean as `1` or `0`, and a vector as its
 --- bytes. A table expands in place. Its array items come first. Each named
@@ -36,10 +58,14 @@
 --- failed.
 ---
 --- Every call waits on a socket, so inside a detached coroutine it suspends
---- that coroutine while the others run. Each coroutine that sends a command
+--- that coroutine while the others run, which lets the handlers of a `web`
+--- application share one client. Each coroutine that sends a command
 --- takes a connection from the pool for the length of that command. When
 --- every connection is taken, the caller waits until one returns. Waiting
 --- callers receive connections in the order of their arrival.
+---
+--- The schemes `rediss` and `valkeys` and the option `tls` need a runtime
+--- with TLS sockets in `network.tls`.
 ---
 --- The client opens a connection with `HELLO 3`. A server that lacks the
 --- command keeps the RESP2 protocol, in which the client converts the
@@ -59,28 +85,19 @@
 
 local M = {}
 
-local type, tostring, tonumber, select, pairs, error = type, tostring, tonumber, select, pairs, error
+local protocol = require("redis.protocol")
+local stores = require("redis.stores")
+
+local type, tostring, tonumber, pairs, error = type, tostring, tonumber, pairs, error
 local setmetatable, getmetatable = setmetatable, getmetatable
-local concat, sort from table
-local byte, sub, find, upper, format, match, gmatch from string
-local floor, ceil, max_of, math_type = math.floor, math.ceil, math.max, math.type
-local v_tostring, v_fromstring, v_create, v_copy = vector.tostring, vector.fromstring, vector.create, vector.copy
+local find, upper, match, gmatch from string
+local floor from math
+local max_of = math.max
 local resume, close, sleep from coroutine
+local Error, Tag, EMPTY, new_error, socket_error from protocol
+local collect, encode, send, read, read_reply, roundtrip, request, reshape from protocol
 
 -- Errors ------------------------------------------------------------------------
-
-local Error = {}
-Error.__index = Error
-Error.__name = "redis.error"
-Error.__tostring = function(e) return e.message end
-
-local function new_error(code, message)
-    return setmetatable({ code = code, message = message }, Error)
-end
-
-local function server_error(text)
-    return new_error(match(text, "^[A-Z][A-Z0-9_-]*") or "ERR", text)
-end
 
 --- Tells whether a value is an error object of the package.
 ---
@@ -92,365 +109,7 @@ function M.is_error(value)
     return getmetatable(value) == Error
 end
 
--- Requests ----------------------------------------------------------------------
-
-local NON_ASCII = "[^\0-\x7f]"
-local EMPTY = {}
-
-local function number_text(a)
-    if math_type(a) ~= "float" then
-        return tostring(a)
-    end
-    if a ~= a then
-        error("cannot send NaN to Redis", 0)
-    end
-    if a == math.huge then
-        return "inf"
-    elseif a == -math.huge then
-        return "-inf"
-    elseif a == floor(a) and a > -1e15 and a < 1e15 then
-        return format("%.0f", a)
-    end
-    return format("%.17g", a)
-end
-
--- Appends the arguments that `a` stands for to `flat` and returns the new
--- count.
-local function flatten(flat, n, a)
-    local t = type(a)
-    if t == "string" or t == "vector" then
-        n = n + 1
-        flat[n] = a
-    elseif t == "number" then
-        n = n + 1
-        flat[n] = number_text(a)
-    elseif t == "table" then
-        local len = #a
-        for i = 1, len do
-            n = flatten(flat, n, a[i])
-        end
-        local names, count = nil, 0
-        for k in pairs(a) do
-            if type(k) == "string" then
-                names = names or {}
-                count = count + 1
-                names[count] = k
-            elseif math_type(k) ~= "integer" or k < 1 or k > len then
-                error(`cannot send a table with the key $(tostring(k)) to Redis`, 0)
-            end
-        end
-        if count > 1 then
-            sort(names)
-        end
-        for i = 1, count do
-            local name = names[i]
-            local value = a[name]
-            if value == true then
-                n = n + 1
-                flat[n] = name
-            elseif value ~= false then
-                n = n + 1
-                flat[n] = name
-                n = flatten(flat, n, value)
-            end
-        end
-    elseif t == "boolean" then
-        n = n + 1
-        flat[n] = a and "1" or "0"
-    else
-        error(`cannot send a $t value to Redis`, 0)
-    end
-    return n
-end
-
--- Flattens the arguments of a command into a list of strings and vectors.
-local function collect(...)
-    local flat, n = {}, 0
-    for i = 1, select("#", ...) do
-        local a = select(i, ...)
-        if a == nil then
-            error(`argument #$i of the Redis command is nil`, 0)
-        end
-        n = flatten(flat, n, a)
-    end
-    if n == 0 then
-        error("a Redis command needs a name", 0)
-    end
-    return flat, n
-end
-
--- Encodes a command as an array of bulk strings. The result is a string, or
--- a list of strings and vectors when an argument is a vector.
-local function encode(flat, n)
-    local parts = { `*$n\r\n` }
-    local count, binary = 1, false
-    for i = 1, n do
-        local a = flat[i]
-        if type(a) == "string" then
-            local len = #a
-            if find(a, NON_ASCII) then
-                len = #v_fromstring(a)
-            end
-            count = count + 1
-            parts[count] = `\$$len\r\n$a\r\n`
-        else
-            binary = true
-            parts[count + 1] = `\$$(#a)\r\n`
-            parts[count + 2] = a
-            parts[count + 3] = "\r\n"
-            count = count + 3
-        end
-    end
-    if binary then
-        return parts
-    end
-    return concat(parts)
-end
-
 -- Connections -------------------------------------------------------------------
-
--- The second result of `read` for an error reply and for a push message.
-local ERR, PUSH = 1, 2
-
--- Returns the error object for a failure of the socket. `cause` is the
--- error object of the socket, whose code "timeout" sets the `timeout` field.
-local function socket_error(cause)
-    local err = new_error("CONNECTION", tostring(cause))
-    if type(cause) == "table" and cause.code == "timeout" then
-        err.timeout = true
-    end
-    return err
-end
-
--- Marks the connection as broken and raises an error object. `cause` is a
--- message, or the error object of a failed socket operation.
-local function fail(conn, code, cause)
-    conn.broken = true
-    if type(cause) == "string" then
-        error(new_error(code, cause), 0)
-    end
-    error(socket_error(cause), 0)
-end
-
-local function send(conn, payload)
-    local sock = conn.sock
-    if type(payload) == "string" then
-        local sent, err = sock:send(payload)
-        if sent == nil then
-            fail(conn, "CONNECTION", err)
-        end
-        return
-    end
-    -- Adjacent strings travel in one write.
-    local pending, count = {}, 0
-    for i = 1, #payload do
-        local part = payload[i]
-        if type(part) == "table" then
-            if count > 0 then
-                send(conn, concat(pending, "", 1, count))
-                count = 0
-            end
-            send(conn, part)
-        elseif type(part) == "string" then
-            count = count + 1
-            pending[count] = part
-        else
-            if count > 0 then
-                send(conn, concat(pending, "", 1, count))
-                count = 0
-            end
-            local sent, err = sock:send(part)
-            if sent == nil then
-                fail(conn, "CONNECTION", err)
-            end
-        end
-    end
-    if count > 0 then
-        send(conn, concat(pending, "", 1, count))
-    end
-end
-
-local function read_line(conn)
-    local line, err = conn.sock:receive("*l")
-    if line == nil then
-        fail(conn, "CONNECTION", err)
-    end
-    if #line == 0 then
-        fail(conn, "CONNECTION", "the server closed the connection")
-    end
-    return v_tostring(line, 0, #line, "lossy")
-end
-
-local CHUNK = 1 << 20
-
--- Reads a bulk payload of `n` bytes and its line end.
-local function read_bulk(conn, n)
-    local sock = conn.sock
-    local data
-    if n + 2 <= CHUNK then
-        local err
-        data, err = sock:receive(n + 2)
-        if data == nil then
-            fail(conn, "CONNECTION", err)
-        end
-        if #data < n + 2 then
-            fail(conn, "CONNECTION", "the server closed the connection")
-        end
-    else
-        data = v_create(n)
-        local at = 0
-        while at < n + 2 do
-            local want = n + 2 - at
-            if want > CHUNK then
-                want = CHUNK
-            end
-            local part, err = sock:receive(want)
-            if part == nil then
-                fail(conn, "CONNECTION", err)
-            end
-            if #part < want then
-                fail(conn, "CONNECTION", "the server closed the connection")
-            end
-            local keep = #part
-            if at + keep > n then
-                keep = n - at
-            end
-            if keep > 0 then
-                v_copy(data, at, part, 0, keep)
-            end
-            at = at + want
-        end
-    end
-    local ok, text = catch v_tostring(data, 0, n)
-    if ok then
-        return text
-    end
-    if #data ~= n then
-        local bytes = v_create(n)
-        if n > 0 then
-            v_copy(bytes, 0, data, 0, n)
-        end
-        return bytes
-    end
-    return data
-end
-
-local function count_of(conn, rest)
-    local n = tonumber(rest)
-    if math_type(n) ~= "integer" then
-        fail(conn, "PROTOCOL", `the reply has the invalid length '$rest'`)
-    end
-    return n
-end
-
--- Reads one reply. The second result is ERR when the reply is an error,
--- whose object is the first result, and PUSH when it is a push message.
-local function read(conn)
-    local line = read_line(conn)
-    local kind = byte(line, 1)
-    local rest = sub(line, 2)
-    if kind == 36 then -- $
-        local n = count_of(conn, rest)
-        if n < 0 then
-            return nil
-        end
-        return read_bulk(conn, n)
-    elseif kind == 43 then -- +
-        return rest
-    elseif kind == 58 then -- :
-        return tonumber(rest)
-    elseif kind == 45 then -- -
-        return server_error(rest), ERR
-    elseif kind == 42 or kind == 62 then -- * and >
-        local n = count_of(conn, rest)
-        if n < 0 then
-            return nil
-        end
-        local list = {}
-        for i = 1, n do
-            list[i] = (read(conn))
-        end
-        if kind == 62 then
-            return list, PUSH
-        end
-        return list
-    elseif kind == 95 then -- _
-        return nil
-    elseif kind == 37 then -- %
-        local map = {}
-        for _ = 1, count_of(conn, rest) do
-            local key = read(conn)
-            local value = read(conn)
-            if key ~= nil then
-                map[key] = value
-            end
-        end
-        return map
-    elseif kind == 126 then -- ~
-        local set = {}
-        for _ = 1, count_of(conn, rest) do
-            local member = read(conn)
-            if member ~= nil then
-                set[member] = true
-            end
-        end
-        return set
-    elseif kind == 35 then -- #
-        return rest == "t"
-    elseif kind == 44 then -- ,
-        if rest == "inf" or rest == "+inf" then
-            return math.huge
-        elseif rest == "-inf" then
-            return -math.huge
-        elseif rest == "nan" or rest == "-nan" then
-            return 0 / 0
-        end
-        return tonumber(rest)
-    elseif kind == 40 then -- (
-        return bigint(rest)
-    elseif kind == 33 then -- !
-        local text = read_bulk(conn, count_of(conn, rest))
-        return server_error(type(text) == "string" and text or v_tostring(text, 0, #text, "lossy")), ERR
-    elseif kind == 61 then -- =
-        local text = read_bulk(conn, count_of(conn, rest))
-        return type(text) == "string" and sub(text, 5) or text
-    elseif kind == 124 then -- |
-        for _ = 1, count_of(conn, rest) * 2 do
-            read(conn)
-        end
-        return read(conn)
-    end
-    fail(conn, "PROTOCOL", `the reply starts with the unknown type '$(sub(line, 1, 1))'`)
-end
-
--- Reads the reply of a command, passing over push messages.
-local function read_reply(conn)
-    local value, tag = read(conn)
-    while tag == PUSH do
-        value, tag = read(conn)
-    end
-    return value, tag
-end
-
--- Sends one command and returns its reply and the tag of `read`. `busy`
--- stays true when an error interrupts the exchange, which tells the pool to
--- close the connection.
-local function roundtrip(conn, payload)
-    conn.busy = true
-    send(conn, payload)
-    local value, tag = read_reply(conn)
-    conn.busy = false
-    return value, tag
-end
-
-local function request(conn, ...)
-    local flat, n = collect(...)
-    local value, tag = roundtrip(conn, encode(flat, n))
-    if tag then
-        error(value, 0)
-    end
-    return value
-end
 
 local Conn = {}
 Conn.__index = Conn
@@ -461,9 +120,11 @@ Conn.__index = Conn
 local function grant(pool, conn)
     local waiters = pool.waiters
     local waiter = waiters[1]
+
     if not waiter then
         return false
     end
+
     table.remove(waiters, 1)
     waiter.granted = true
     waiter.conn = conn
@@ -484,9 +145,11 @@ end
 -- connection directly.
 Conn.__close = function(conn)
     local pool = conn.pool
+
     if not pool then
         return
     end
+
     if conn.busy or conn.broken or conn.watching or pool.closed then
         conn.sock:close()
         vacate(pool)
@@ -497,24 +160,32 @@ Conn.__close = function(conn)
 end
 
 local function handshake(conn, config)
-    local password, username, name = config.password, config.username, config.client_name
+    local password, username from config
+    local name = config.client_name
     local fallback = config.protocol == 2
+
     if not fallback then
         local hello = { "HELLO", "3" }
+
         if password then
             hello[#hello + 1] = { "AUTH", username or "default", password }
         end
+
         if name then
             hello[#hello + 1] = { "SETNAME", name }
         end
+
         local flat, n = collect(hello)
         local reply, tag = roundtrip(conn, encode(flat, n))
+
         if not tag then
             conn.resp = 3
             conn.server = reply
         else
             local code = reply.code
-            if code == "NOPROTO" or (code == "NOAUTH" and password)
+
+            if code == "NOPROTO"
+                or (code == "NOAUTH" and password)
                 or (code == "ERR" and find(reply.message, "unknown command", 1, true)) then
                 fallback = true
             else
@@ -522,8 +193,10 @@ local function handshake(conn, config)
             end
         end
     end
+
     if fallback then
         conn.resp = 2
+
         if password then
             if username then
                 request(conn, "AUTH", username, password)
@@ -531,10 +204,12 @@ local function handshake(conn, config)
                 request(conn, "AUTH", password)
             end
         end
+
         if name then
             request(conn, "CLIENT", "SETNAME", name)
         end
     end
+
     if config.db and config.db ~= 0 then
         request(conn, "SELECT", config.db)
     end
@@ -544,15 +219,18 @@ end
 local function open(config)
     -- The timeout bounds the connection and the TLS handshake, then stays
     -- on the socket as the timeout of every wait.
-    local sock, err
-    if config.tls then
-        sock, err = network.tls.connect(config.host, config.port, config.tls)
-    else
-        sock, err = network.tcp.connect(config.host, config.port, config.connect)
+    local sock, err = do
+        if config.tls then
+            provide network.tls.connect(config.host, config.port, config.tls)
+        end
+
+        provide network.tcp.connect(config.host, config.port, config.connect)
     end
+
     if sock == nil then
         error(socket_error(err), 0)
     end
+
     local conn = setmetatable({
         sock = sock,
         pool = false,
@@ -563,65 +241,18 @@ local function open(config)
         server = false,
     }, Conn)
     local ready, reason = catch handshake(conn, config)
+
     if not ready then
         sock:close()
+
         if type(reason) == "string" then
             reason = new_error("CONNECTION", reason)
         end
+
         error(reason, 0)
     end
+
     return conn
-end
-
--- RESP2 replies ------------------------------------------------------------------
-
-local function pairs_to_map(list)
-    local map = {}
-    for i = 1, #list, 2 do
-        map[list[i]] = list[i + 1]
-    end
-    return map
-end
-
-local function list_to_set(list)
-    local set = {}
-    for i = 1, #list do
-        set[list[i]] = true
-    end
-    return set
-end
-
-local function text_to_number(text)
-    return tonumber(text)
-end
-
--- The commands whose RESP2 reply differs in type from their RESP3 reply.
-local RESP2 = {
-    HGETALL = pairs_to_map,
-    ["CONFIG GET"] = pairs_to_map,
-    SMEMBERS = list_to_set,
-    SINTER = list_to_set,
-    SUNION = list_to_set,
-    SDIFF = list_to_set,
-    ZSCORE = text_to_number,
-    ZINCRBY = text_to_number,
-}
-
--- Converts the RESP2 reply of the command in `flat` to its RESP3 value.
-local function reshape(flat, value)
-    local name = flat[1]
-    if value == nil or type(name) ~= "string" or getmetatable(value) == Error then
-        return value
-    end
-    name = upper(name)
-    local convert = RESP2[name]
-    if convert == nil and name == "CONFIG" and type(flat[2]) == "string" then
-        convert = RESP2[`$name $(upper(flat[2]))`]
-    end
-    if convert and (type(value) == "table" or convert == text_to_number) then
-        return convert(value)
-    end
-    return value
 end
 
 -- Command methods -----------------------------------------------------------------
@@ -634,20 +265,33 @@ local Commands = setmetatable({}, {
         if type(name) ~= "string" or not find(name, "^%l[%l%d_]*$") then
             return nil
         end
+
         local words = {}
+
         for word in gmatch(name, "[^_]+") do
             words[#words + 1] = upper(word)
         end
+
         local method
+
         if #words == 1 then
             local a = words[1]
-            method = function(self, ...) return self:call(a, ...) end
+
+            method = function(self, ...)
+                return self:call(a, ...)
+            end
         elseif #words == 2 then
             local a, b = words[1], words[2]
-            method = function(self, ...) return self:call(a, b, ...) end
+
+            method = function(self, ...)
+                return self:call(a, b, ...)
+            end
         else
-            method = function(self, ...) return self:call(words, ...) end
+            method = function(self, ...)
+                return self:call(words, ...)
+            end
         end
+
         commands[name] = method
         return method
     end,
@@ -682,24 +326,30 @@ end
 local Waiter = {
     __close = function(waiter)
         local pool = waiter.pool
+
         if waiter.taken then
             return
         end
+
         if waiter.granted then
             if conn = waiter.conn then
                 Conn.__close(conn)
             else
                 vacate(pool)
             end
+
             return
         end
+
         local waiters = pool.waiters
+
         for i = 1, #waiters do
             if waiters[i] == waiter then
                 table.remove(waiters, i)
                 break
             end
         end
+
         close(waiter.sleep)
     end,
 }
@@ -712,19 +362,22 @@ local function checkout(pool)
     if pool.closed then
         error(new_error("CONNECTION", "the client is closed"), 0)
     end
+
     local idle = pool.idle
     local n = #idle
+
     if n > 0 then
         local conn = idle[n]
         idle[n] = nil
         return conn
     end
+
     if pool.size < pool.max then
         pool.size = pool.size + 1
         return open_place(pool)
     end
-    local granted, conn = false, false
-    do
+
+    local granted, conn = do
         local waiters = pool.waiters
         local waiter <close> = setmetatable({
             pool = pool,
@@ -735,22 +388,27 @@ local function checkout(pool)
         }, Waiter)
         waiters[#waiters + 1] = waiter
         resume(waiter.sleep)
-        granted, conn = waiter.granted, waiter.conn
-        waiter.taken = granted
+        waiter.taken = waiter.granted
+        provide waiter.granted, waiter.conn
     end
+
     if granted then
         return conn or open_place(pool)
     end
+
     if pool.closed then
         error(new_error("CONNECTION", "the client is closed"), 0)
     end
+
     -- The resume returns without a grant when every detached coroutine
     -- waits for another one, so no command can end.
     error(new_error("CONNECTION", "every connection of the pool is in use and none can return"), 0)
 end
 
 local function percent_decode(text)
-    return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+    return (text:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
 end
 
 local SCHEMES = { redis = false, valkey = false, rediss = true, valkeys = true }
@@ -758,53 +416,74 @@ local SCHEMES = { redis = false, valkey = false, rediss = true, valkeys = true }
 local function parse_url(url)
     local scheme, rest = match(url, "^(%a[%w+.-]*)://(.*)$")
     local tls = scheme and SCHEMES[scheme:lower()]
+
     if tls == nil then
         error(`invalid Redis URL '$url'`, 0)
     end
+
     rest = match(rest, "^[^?#]*")
     local authority, path = match(rest, "^([^/]*)(.*)$")
     local config = { tls = tls or nil }
     local userinfo, address = match(authority, "^(.*)@(.*)$")
+
     if userinfo then
         local user, password = match(userinfo, "^([^:]*):(.*)$")
-        if user == nil then
-            user = userinfo
-        end
+
+        user = user or userinfo
+
         if user ~= "" then
             config.username = percent_decode(user)
         end
+
         if password and password ~= "" then
             config.password = percent_decode(password)
         end
     else
         address = authority
     end
+
     local host, port = match(address, "^%[(.*)%]:?(%d*)$")
+
     if host == nil then
         host, port = match(address, "^([^:]*):?(%d*)$")
     end
+
     if host == nil then
         error(`invalid Redis URL '$url'`, 0)
     end
+
     if host ~= "" then
         config.host = host
     end
+
     if port ~= "" then
         config.port = tonumber(port)
     end
+
     if path ~= "" and path ~= "/" then
         local db = match(path, "^/(%d+)$")
+
         if db == nil then
             error(`invalid database in the Redis URL '$url'`, 0)
         end
+
         config.db = tonumber(db)
     end
+
     return config
 end
 
 local OPTIONS = {
-    host = "string", port = "number", username = "string", password = "string", db = "number",
-    tls = true, timeout = "number", pool = "number", client_name = "string", protocol = "number",
+    host = "string",
+    port = "number",
+    username = "string",
+    password = "string",
+    db = "number",
+    tls = true,
+    timeout = "number",
+    pool = "number",
+    client_name = "string",
+    protocol = "number",
 }
 
 --- Connects to a Redis server and returns a client.
@@ -842,6 +521,7 @@ local OPTIONS = {
 --- @return table The client.
 function M.connect(target, options)
     local config
+
     if type(target) == "string" then
         config = parse_url(target)
     elseif type(target) == "table" then
@@ -850,33 +530,37 @@ function M.connect(target, options)
     else
         error("bad argument #1 to 'connect' (string or table expected)", 2)
     end
+
     for name, value in pairs(options or EMPTY) do
         local kind = OPTIONS[name]
+
         if kind == nil then
-            error(`unknown redis option '$(tostring(name))'`, 2)
+            error(`unknown redis option '$name'`, 2)
         end
+
         if kind ~= true and type(value) ~= kind then
             error(`the redis option '$name' must be a $kind`, 2)
         end
+
         config[name] = value
     end
+
     config.host = config.host or "127.0.0.1"
     config.port = config.port or 6379
+
     if config.tls then
-        local tls = {}
-        if type(config.tls) == "table" then
-            for name, value in pairs(config.tls) do
-                tls[name] = value
-            end
-        end
+        local tls = type(config.tls) == "table" and table.clone(config.tls) or {}
+
         if tls.timeout == nil then
             tls.timeout = config.timeout
         end
+
         config.tls = tls
     else
         config.tls = false
         config.connect = config.timeout and { timeout = config.timeout } or nil
     end
+
     local client = setmetatable({
         config = config,
         idle = {},
@@ -886,11 +570,13 @@ function M.connect(target, options)
         closed = false,
         resp = 3,
     }, ClientMeta)
+
     do
         local conn <close> = checkout(client)
         client.resp = conn.resp
         client.server = conn.server
     end
+
     return client
 end
 
@@ -909,12 +595,15 @@ function Client:call(...)
     local flat, n = collect(...)
     local conn <close> = checkout(self)
     local value, tag = roundtrip(conn, encode(flat, n))
+
     if tag then
         error(value, 0)
     end
+
     if conn.resp == 2 then
         return reshape(flat, value)
     end
+
     return value
 end
 
@@ -943,17 +632,21 @@ function Client:close()
     if self.closed then
         return
     end
+
     self.closed = true
     local idle = self.idle
+
     for i = #idle, 1, -1 do
         idle[i].sock:close()
         idle[i] = nil
         self.size = self.size - 1
     end
+
     -- The callers that wait for a connection wake up and raise the error
     -- of a closed client.
     local waiters = self.waiters
     self.waiters = {}
+
     for i = 1, #waiters do
         close(waiters[i].sleep)
     end
@@ -996,21 +689,27 @@ function Client:pipeline(fn)
     fn(batch)
     local count = batch.count
     local results = { n = count }
+
     if count == 0 then
         return results
     end
+
     local conn <close> = checkout(self)
     conn.busy = true
     send(conn, batch.payloads)
     local commands = batch.commands
     local resp2 = conn.resp == 2
+
     for i = 1, count do
         local value = read_reply(conn)
+
         if resp2 then
             value = reshape(commands[i], value)
         end
+
         results[i] = value
     end
+
     conn.busy = false
     return results
 end
@@ -1024,17 +723,22 @@ local BoundMeta = { __index = Bound, __name = "redis.connection" }
 
 function Bound:call(...)
     local conn = self.conn
+
     if not conn then
         error("the transaction has ended", 2)
     end
+
     local flat, n = collect(...)
     local value, tag = roundtrip(conn, encode(flat, n))
+
     if tag then
         error(value, 0)
     end
+
     if conn.resp == 2 then
         return reshape(flat, value)
     end
+
     return value
 end
 
@@ -1045,24 +749,30 @@ local EXEC = "*1\r\n$4\r\nEXEC\r\n"
 -- watched key changed.
 local function attempt(conn, fn, watch)
     local bound = setmetatable({ conn = conn }, BoundMeta)
+
     if watch then
         request(conn, "WATCH", watch)
         conn.watching = true
     end
+
     local batch = new_batch()
     local ok, err = catch fn(batch, bound)
     bound.conn = false
     local count = batch.count
+
     if not ok or count == 0 then
         if watch and not conn.busy and not conn.broken then
             request(conn, "UNWATCH")
             conn.watching = false
         end
+
         if not ok then
             error(err, 0)
         end
+
         return { n = 0 }
     end
+
     local payloads = batch.payloads
     table.insert(payloads, 1, MULTI)
     payloads[count + 2] = EXEC
@@ -1070,30 +780,39 @@ local function attempt(conn, fn, watch)
     send(conn, payloads)
     local first = nil
     local started, tag = read_reply(conn)
+
     if tag then
         first = started
     end
+
     for _ = 1, count do
         local queued, queue_tag = read_reply(conn)
+
         if queue_tag and first == nil then
             first = queued
         end
     end
+
     local replies, exec_tag = read_reply(conn)
     conn.busy = false
     conn.watching = false
+
     if exec_tag then
         error(first or replies, 0)
     end
+
     if replies == nil then
         return nil
     end
+
     if conn.resp == 2 then
         local commands = batch.commands
+
         for i = 1, count do
             replies[i] = reshape(commands[i], replies[i])
         end
     end
+
     replies.n = count
     return replies
 end
@@ -1128,17 +847,21 @@ end
 --- @param options table? `watch` and `retries`.
 --- @return table? The replies, or nil when a watched key changed.
 function Client:transaction(fn, options)
-    local watch = options and options.watch or nil
+    local watch = options?.watch
+
     if type(watch) == "table" and #watch == 0 then
         watch = nil
     end
-    local retries = options and options.retries or 0
+
+    local retries = options?.retries or 0
     local conn <close> = checkout(self)
+
     for _ = 0, retries do
         if replies = attempt(conn, fn, watch) then
             return replies
         end
     end
+
     return nil
 end
 
@@ -1153,21 +876,29 @@ Subscription.__name = "redis.subscription"
 -- message that confirms a change of the subscriptions.
 local function sub_read(self)
     local frame, tag = read(self.conn)
-    if tag == ERR then
+
+    if tag == Tag.err then
         error(frame, 0)
     end
+
     if type(frame) ~= "table" then
         return nil
     end
+
     local kind = frame[1]
+
     if kind == "message" then
         return frame[2], frame[3]
     elseif kind == "pmessage" then
         return frame[3], frame[4], frame[2]
-    elseif kind == "subscribe" or kind == "psubscribe" or kind == "unsubscribe" or kind == "punsubscribe" then
+    elseif kind == "subscribe"
+        or kind == "psubscribe"
+        or kind == "unsubscribe"
+        or kind == "punsubscribe" then
         self.count = frame[3]
         self.acks = self.acks - 1
     end
+
     return nil
 end
 
@@ -1177,13 +908,16 @@ local function sub_send(self, command, names, acks)
     if self.closed then
         error(new_error("CONNECTION", "the subscription is closed"), 0)
     end
+
     local flat, n = collect(command, names)
     local conn = self.conn
     self.acks = self.acks + acks
     send(conn, encode(flat, n))
     local queue = self.queue
+
     while self.acks > 0 do
         local channel, message, pattern = sub_read(self)
+
         if channel ~= nil then
             queue[#queue + 1] = { channel, message, pattern }
         end
@@ -1198,17 +932,22 @@ end
 
 local function remove_names(self, field, names)
     local set = self[field]
+
     if #names == 0 then
         local n = 0
+
         for _ in pairs(set) do
             n = n + 1
         end
+
         self[field] = {}
         return max_of(1, n)
     end
+
     for i = 1, #names do
         set[names[i]] = nil
     end
+
     return #names
 end
 
@@ -1220,6 +959,7 @@ end
 --- @param ... string The channels.
 function Subscription:subscribe(...)
     local names = { ... }
+
     if #names > 0 then
         add_names(self.channels, names)
         sub_send(self, "SUBSCRIBE", names, #names)
@@ -1234,6 +974,7 @@ end
 --- @param ... string The patterns.
 function Subscription:psubscribe(...)
     local names = { ... }
+
     if #names > 0 then
         add_names(self.patterns, names)
         sub_send(self, "PSUBSCRIBE", names, #names)
@@ -1276,26 +1017,33 @@ Subscription.__close = Subscription.close
 -- The iterator of a subscription. Each step waits for the next message.
 local function next_message(self)
     local queue = self.queue
+
     while true do
         if #queue > 0 then
             local item = table.remove(queue, 1)
             return item[1], item[2], item[3]
         end
+
         if self.closed then
             return nil
         end
+
         if self.count == 0 and self.acks <= 0 then
             self:close()
             return nil
         end
+
         local ok, channel, message, pattern = catch sub_read(self)
+
         if not ok then
             if self.closed then
                 return nil
             end
+
             self:close()
             error(channel, 0)
         end
+
         if channel ~= nil then
             return channel, message, pattern
         end
@@ -1306,10 +1054,13 @@ local function subscription(client, command, names)
     if #names == 0 then
         error(`bad argument #1 to '$(command:lower())' (channel expected)`, 3)
     end
+
     local config = client.config
+
     if client.closed then
         error(new_error("CONNECTION", "the client is closed"), 0)
     end
+
     local conn = open(config)
     -- A subscription waits for as long as no message arrives.
     conn.sock:settimeout(nil)
@@ -1324,10 +1075,12 @@ local function subscription(client, command, names)
     }, Subscription)
     add_names(command == "SUBSCRIBE" and self.channels or self.patterns, names)
     local ok, err = catch sub_send(self, command, names, #names)
+
     if not ok then
         self:close()
         error(err, 0)
     end
+
     return next_message, self, nil, self
 end
 
@@ -1382,19 +1135,22 @@ Script.__call = function(self, keys, ...)
     keys = keys or EMPTY
     local flat, n = collect("EVALSHA", self.sha, #keys, keys, ...)
     local payload = encode(flat, n)
-    local value, tag
-    do
+
+    local value, tag = do
         local conn <close> = checkout(client)
-        value, tag = roundtrip(conn, payload)
+        provide roundtrip(conn, payload)
     end
+
     if tag and value.code == "NOSCRIPT" then
         client:call("SCRIPT", "LOAD", self.source)
         local conn <close> = checkout(client)
         value, tag = roundtrip(conn, payload)
     end
+
     if tag then
         error(value, 0)
     end
+
     return value
 end
 
@@ -1416,6 +1172,7 @@ function Client:script(source)
     if type(source) ~= "string" then
         error("bad argument #1 to 'script' (string expected)", 2)
     end
+
     return setmetatable({
         client = self,
         source = source,
@@ -1428,26 +1185,32 @@ end
 local function scanner(client, command, key, options, paired, numeric)
     options = options or EMPTY
     local cursor, batch, at, size, done = "0", EMPTY, 0, 0, false
+
     return function()
         while at >= size do
             if done then
                 return nil
             end
-            local reply
-            if key ~= nil then
-                reply = client:call(command, key, cursor, options)
-            else
-                reply = client:call(command, cursor, options)
+
+            local reply = do
+                if key ~= nil then
+                    provide client:call(command, key, cursor, options)
+                end
+
+                provide client:call(command, cursor, options)
             end
+
             cursor, batch = tostring(reply[1]), reply[2]
             at, size = 0, #batch
             done = cursor == "0"
         end
+
         if paired then
             at = at + 2
             local value = batch[at]
             return batch[at - 1], numeric and tonumber(value) or value
         end
+
         at = at + 1
         return batch[at]
     end
@@ -1493,64 +1256,6 @@ function Client:zscan(key, options)
     return scanner(self, "ZSCAN", key, options, true, true)
 end
 
--- The store of rate_limit ----------------------------------------------------------
-
-local function milliseconds(seconds)
-    return max_of(1, ceil(seconds * 1000))
-end
-
-local RATE_INCR = [[
--- rate_limit.incr
-local count = redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
-local ttl = redis.call('PTTL', KEYS[1])
-if ttl < 0 then
-  ttl = tonumber(ARGV[2])
-  redis.call('PEXPIRE', KEYS[1], ttl)
-end
-return {count, ttl}
-]]
-
-local RATE_TAKE = [[
--- rate_limit.take
-local cost, interval = tonumber(ARGV[1]), tonumber(ARGV[2])
-local burst, now = tonumber(ARGV[3]), tonumber(ARGV[4])
-local stored = redis.call('GET', KEYS[1])
-local full_at = stored and tonumber(stored)
-if not full_at or full_at < now then
-  full_at = now
-end
-local debt = full_at + cost * interval - now
-if debt > burst * interval + 1e-9 then
-  return {0, string.format('%.17g', full_at - now)}
-end
-local ttl = math.max(1, math.ceil(debt * 1000))
-redis.call('SET', KEYS[1], string.format('%.17g', now + debt), 'PX', ttl)
-return {1, string.format('%.17g', debt)}
-]]
-
-local RateStore = {}
-RateStore.__index = RateStore
-
-function RateStore:incr(key, ttl, amount)
-    local reply = self.incr_script({ self.prefix .. key }, amount or 1, milliseconds(ttl))
-    return tonumber(reply[1]), reply[2] / 1000
-end
-
-function RateStore:get(key)
-    local value = self.client:call("GET", self.prefix .. key)
-    return value and tonumber(value) or nil
-end
-
-function RateStore:set(key, value, ttl)
-    self.client:call("SET", self.prefix .. key, format("%.17g", value), "PX", milliseconds(ttl))
-end
-
-function RateStore:take(key, cost, interval, burst, now)
-    local reply = self.take_script({ self.prefix .. key }, format("%.17g", cost), format("%.17g", interval),
-        format("%.17g", burst), format("%.17g", now))
-    return reply[1] == 1, tonumber(reply[2])
-end
-
 --- Returns a store for the `rate_limit` package that keeps its counters in
 --- Redis.
 ---
@@ -1566,33 +1271,7 @@ end
 --- @param options table? `prefix`.
 --- @return table The store.
 function M.rate_limit_store(client, options)
-    return setmetatable({
-        client = client,
-        prefix = options and options.prefix or "rate_limit:",
-        incr_script = client:script(RATE_INCR),
-        take_script = client:script(RATE_TAKE),
-    }, RateStore)
-end
-
--- The store of session -------------------------------------------------------------
-
-local SessionStore = {}
-SessionStore.__index = SessionStore
-
-function SessionStore:get(id)
-    local text = self.client:call("GET", self.prefix .. id)
-    if type(text) ~= "string" then
-        return nil
-    end
-    return fromjson(text)
-end
-
-function SessionStore:set(id, data, ttl)
-    self.client:call("SET", self.prefix .. id, tojson(data), "PX", milliseconds(ttl))
-end
-
-function SessionStore:destroy(id)
-    self.client:call("DEL", self.prefix .. id)
+    return stores.rate_limit(client, options)
 end
 
 --- Returns a store for the `session` package that keeps its sessions in
@@ -1608,268 +1287,7 @@ end
 --- @param options table? `prefix`.
 --- @return table The store.
 function M.session_store(client, options)
-    return setmetatable({
-        client = client,
-        prefix = options and options.prefix or "session:",
-    }, SessionStore)
-end
-
--- The store of queue ---------------------------------------------------------------
-
--- Every key of a queue starts with `KEYS[1]`, which ends in a hash tag, so
--- the keys of one queue share a slot of a cluster.
---
--- - `job:ID` is a hash with the fields of a job and its sequence number.
--- - `timed` is a sorted set of the waiting jobs by the time they become due.
--- - `ready` is a sorted set of the due jobs. The score is the negated
---   priority. The member is the due time and the sequence number as two
---   numbers of 15 digits, then the id, so the first member is the job that
---   workers take first.
--- - `active` is a sorted set of the claimed jobs by the end of their lease.
--- - `stale` is a set of the jobs in `ready` whose lease ran out, which
---   stay active until a worker claims them again.
--- - `completed` and `failed` are sorted sets by the time the jobs ended.
--- - `seq` counts the jobs.
-
-local QUEUE_ADD = [[
--- queue.add
-local base = KEYS[1]
-local job = base .. 'job:' .. ARGV[1]
-if redis.call('EXISTS', job) == 1 then
-  return 0
-end
-local seq = redis.call('INCR', base .. 'seq')
-redis.call('HSET', job, 'id', ARGV[1], 'data', ARGV[2], 'status', 'waiting',
-  'priority', ARGV[3], 'attempts', 0, 'max_attempts', ARGV[4],
-  'run_at', ARGV[5], 'created_at', ARGV[6], 'seq', seq)
-redis.call('ZADD', base .. 'timed', ARGV[5], ARGV[1])
-return 1
-]]
-
-local QUEUE_CLAIM = [[
--- queue.claim
-local base = KEYS[1]
-local now, lease = ARGV[1], ARGV[2]
-local ready = base .. 'ready'
-local function promote(source, stale)
-  local ids = redis.call('ZRANGEBYSCORE', source, '-inf', now)
-  for i = 1, #ids do
-    local id = ids[i]
-    local f = redis.call('HMGET', base .. 'job:' .. id, 'priority', 'run_at', 'seq')
-    redis.call('ZREM', source, id)
-    if f[1] then
-      local member = string.format('%015.0f%015.0f', tonumber(f[2]), tonumber(f[3])) .. id
-      redis.call('ZADD', ready, -tonumber(f[1]), member)
-      if stale then
-        redis.call('SADD', base .. 'stale', id)
-      end
-    end
-  end
-end
-promote(base .. 'active', true)
-promote(base .. 'timed', false)
-while true do
-  local first = redis.call('ZRANGE', ready, 0, 0)
-  if #first == 0 then
-    return false
-  end
-  redis.call('ZREM', ready, first[1])
-  local id = string.sub(first[1], 31)
-  local job = base .. 'job:' .. id
-  redis.call('SREM', base .. 'stale', id)
-  if redis.call('EXISTS', job) == 1 then
-    local attempts = redis.call('HINCRBY', job, 'attempts', 1)
-    redis.call('HSET', job, 'status', 'active', 'run_at', lease)
-    redis.call('ZADD', base .. 'active', lease, id)
-    local f = redis.call('HMGET', job, 'data', 'max_attempts', 'priority', 'created_at')
-    return {id, f[1], attempts, tonumber(f[2]), tonumber(f[3]), tonumber(f[4])}
-  end
-end
-]]
-
--- The start of `complete` and `fail`: the job must be active with the
--- attempts of the caller, and it leaves the sets of the active jobs.
-local QUEUE_HELD = [[
-local base = KEYS[1]
-local id = ARGV[1]
-local job = base .. 'job:' .. id
-local f = redis.call('HMGET', job, 'status', 'attempts', 'run_at', 'seq')
-if f[1] ~= 'active' or f[2] ~= ARGV[2] then
-  return 0
-end
-redis.call('ZREM', base .. 'active', id)
-if redis.call('SREM', base .. 'stale', id) == 1 then
-  local member = string.format('%015.0f%015.0f', tonumber(f[3]), tonumber(f[4])) .. id
-  redis.call('ZREM', base .. 'ready', member)
-end
-]]
-
-local QUEUE_COMPLETE = `-- queue.complete\n$QUEUE_HELD` .. [[
-if ARGV[4] == '1' then
-  redis.call('DEL', job)
-else
-  redis.call('HSET', job, 'status', 'completed', 'finished_at', ARGV[3])
-  redis.call('ZADD', base .. 'completed', ARGV[3], id)
-end
-return 1
-]]
-
-local QUEUE_FAIL = `-- queue.fail\n$QUEUE_HELD` .. [[
-if ARGV[5] ~= '' then
-  redis.call('HSET', job, 'status', 'waiting', 'run_at', ARGV[5], 'last_error', ARGV[3])
-  redis.call('ZADD', base .. 'timed', ARGV[5], id)
-else
-  redis.call('HSET', job, 'status', 'failed', 'finished_at', ARGV[4], 'last_error', ARGV[3])
-  redis.call('ZADD', base .. 'failed', ARGV[4], id)
-end
-return 1
-]]
-
-local QUEUE_STATS = [[
--- queue.stats
-local base = KEYS[1]
-local stale = redis.call('SCARD', base .. 'stale')
-local timed = redis.call('ZCARD', base .. 'timed')
-local due = redis.call('ZCOUNT', base .. 'timed', '-inf', ARGV[1])
-return {
-  redis.call('ZCARD', base .. 'ready') - stale + due,
-  timed - due,
-  redis.call('ZCARD', base .. 'active') + stale,
-  redis.call('ZCARD', base .. 'completed'),
-  redis.call('ZCARD', base .. 'failed'),
-}
-]]
-
-local QUEUE_NEXT_AT = [[
--- queue.next_at
-local base = KEYS[1]
-local at = false
-local function consider(value)
-  value = tonumber(value)
-  if value and (not at or value < at) then
-    at = value
-  end
-end
-local first = redis.call('ZRANGE', base .. 'ready', 0, 0)
-if first[1] then
-  consider(string.sub(first[1], 1, 15))
-end
-consider(redis.call('ZRANGE', base .. 'timed', 0, 0, 'WITHSCORES')[2])
-consider(redis.call('ZRANGE', base .. 'active', 0, 0, 'WITHSCORES')[2])
-return at
-]]
-
-local QUEUE_RETRY_FAILED = [[
--- queue.retry_failed
-local base = KEYS[1]
-local ids = redis.call('ZRANGE', base .. 'failed', 0, -1)
-for i = 1, #ids do
-  local job = base .. 'job:' .. ids[i]
-  redis.call('HSET', job, 'status', 'waiting', 'attempts', 0, 'run_at', ARGV[1])
-  redis.call('HDEL', job, 'finished_at')
-  redis.call('ZADD', base .. 'timed', ARGV[1], ids[i])
-end
-redis.call('DEL', base .. 'failed')
-return #ids
-]]
-
-local QUEUE_CLEAN = [[
--- queue.clean
-local base = KEYS[1]
-if ARGV[1] ~= 'completed' and ARGV[1] ~= 'failed' then
-  return 0
-end
-local set = base .. ARGV[1]
-local ids = redis.call('ZRANGEBYSCORE', set, '-inf', ARGV[2])
-for i = 1, #ids do
-  redis.call('DEL', base .. 'job:' .. ids[i])
-end
-redis.call('ZREMRANGEBYSCORE', set, '-inf', ARGV[2])
-return #ids
-]]
-
-local QueueStore = {}
-QueueStore.__index = QueueStore
-
--- Times and counts travel as whole numbers.
-local function whole(n)
-    return format("%.0f", n)
-end
-
-local function base_of(self, queue)
-    return { `$(self.prefix){$queue}:` }
-end
-
-function QueueStore:add(queue, job)
-    return self.add_script(base_of(self, queue), job.id, job.data, whole(job.priority), whole(job.max_attempts),
-        whole(job.run_at), whole(job.created_at)) == 1
-end
-
-function QueueStore:claim(queue, now, lease)
-    local reply = self.claim_script(base_of(self, queue), whole(now), whole(lease))
-    if reply == nil then
-        return nil
-    end
-    return {
-        id = reply[1],
-        data = reply[2],
-        attempts = reply[3],
-        max_attempts = reply[4],
-        priority = reply[5],
-        created_at = reply[6],
-    }
-end
-
-function QueueStore:complete(queue, id, attempts, now, remove)
-    return self.complete_script(base_of(self, queue), id, whole(attempts), whole(now), remove and "1" or "0") == 1
-end
-
-function QueueStore:fail(queue, id, attempts, message, now, retry_at)
-    return self.fail_script(base_of(self, queue), id, whole(attempts), message, whole(now),
-        retry_at and whole(retry_at) or "") == 1
-end
-
-local JOB_NUMBERS = { "priority", "attempts", "max_attempts", "run_at", "created_at", "finished_at" }
-
-function QueueStore:get(queue, id)
-    local job = self.client:call("HGETALL", `$(base_of(self, queue)[1])job:$id`)
-    if job.id == nil then
-        return nil
-    end
-    for i = 1, #JOB_NUMBERS do
-        local name = JOB_NUMBERS[i]
-        if job[name] ~= nil then
-            job[name] = tonumber(job[name])
-        end
-    end
-    job.seq = nil
-    return job
-end
-
-function QueueStore:stats(queue, now)
-    local reply = self.stats_script(base_of(self, queue), whole(now))
-    return {
-        waiting = reply[1],
-        delayed = reply[2],
-        active = reply[3],
-        completed = reply[4],
-        failed = reply[5],
-    }
-end
-
-function QueueStore:next_at(queue)
-    return self.next_at_script(base_of(self, queue))
-end
-
-function QueueStore:retry_failed(queue, now)
-    return self.retry_failed_script(base_of(self, queue), whole(now))
-end
-
-function QueueStore:clean(queue, status, before)
-    return self.clean_script(base_of(self, queue), status, whole(before))
-end
-
-function QueueStore:close()
+    return stores.session(client, options)
 end
 
 --- Returns a store for the `queue` package that keeps its jobs in Redis.
@@ -1892,18 +1310,7 @@ end
 --- @param options table? `prefix`.
 --- @return table The store.
 function M.queue_store(client, options)
-    return setmetatable({
-        client = client,
-        prefix = options and options.prefix or "queue:",
-        add_script = client:script(QUEUE_ADD),
-        claim_script = client:script(QUEUE_CLAIM),
-        complete_script = client:script(QUEUE_COMPLETE),
-        fail_script = client:script(QUEUE_FAIL),
-        stats_script = client:script(QUEUE_STATS),
-        next_at_script = client:script(QUEUE_NEXT_AT),
-        retry_failed_script = client:script(QUEUE_RETRY_FAILED),
-        clean_script = client:script(QUEUE_CLEAN),
-    }, QueueStore)
+    return stores.queue(client, options)
 end
 
 return M

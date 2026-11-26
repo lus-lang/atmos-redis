@@ -1,0 +1,549 @@
+-- The RESP protocol of the redis package: the error objects, the encoding of
+-- commands, and the reading of replies from a connection.
+
+local P = {}
+
+local type, tostring, tonumber, select = type, tostring, tonumber, select
+local pairs, error, setmetatable = pairs, error, setmetatable
+local concat, sort from table
+local byte, sub, find, upper, format, match from string
+local floor from math
+local math_type = math.type
+local v_tostring, v_fromstring, v_create, v_copy = vector.tostring, vector.fromstring, vector.create, vector.copy
+
+-- Errors ------------------------------------------------------------------------
+
+local Error = {}
+Error.__index = Error
+Error.__name = "redis.error"
+
+Error.__tostring = function(e)
+    return e.message
+end
+
+local function new_error(code, message)
+    return setmetatable({ code = code, message = message }, Error)
+end
+
+local function server_error(text)
+    return new_error(match(text, "^[A-Z][A-Z0-9_-]*") or "ERR", text)
+end
+
+-- Requests ----------------------------------------------------------------------
+
+local NON_ASCII = "[^\0-\x7f]"
+local EMPTY = {}
+
+local function number_text(a)
+    if math_type(a) ~= "float" then
+        return tostring(a)
+    end
+
+    if a ~= a then
+        error("cannot send NaN to Redis", 0)
+    end
+
+    if a == math.huge then
+        return "inf"
+    elseif a == -math.huge then
+        return "-inf"
+    elseif a == floor(a) and a > -1e15 and a < 1e15 then
+        return format("%.0f", a)
+    end
+
+    return format("%.17g", a)
+end
+
+-- Appends the arguments that `a` stands for to `flat` and returns the new
+-- count.
+local function flatten(flat, n, a)
+    local t = type(a)
+
+    if t == "string" or t == "vector" then
+        n = n + 1
+        flat[n] = a
+    elseif t == "number" then
+        n = n + 1
+        flat[n] = number_text(a)
+    elseif t == "table" then
+        local len = #a
+
+        for i = 1, len do
+            n = flatten(flat, n, a[i])
+        end
+
+        local names, count = nil, 0
+
+        for k in pairs(a) do
+            if type(k) == "string" then
+                names = names or {}
+                count = count + 1
+                names[count] = k
+            elseif math_type(k) ~= "integer" or k < 1 or k > len then
+                error(`cannot send a table with the key $k to Redis`, 0)
+            end
+        end
+
+        if count > 1 then
+            sort(names)
+        end
+
+        for i = 1, count do
+            local name = names[i]
+            local value = a[name]
+
+            if value == true then
+                n = n + 1
+                flat[n] = name
+            elseif value ~= false then
+                n = n + 1
+                flat[n] = name
+                n = flatten(flat, n, value)
+            end
+        end
+    elseif t == "boolean" then
+        n = n + 1
+        flat[n] = a and "1" or "0"
+    else
+        error(`cannot send a $t value to Redis`, 0)
+    end
+
+    return n
+end
+
+-- Flattens the arguments of a command into a list of strings and vectors.
+local function collect(...)
+    local flat, n = {}, 0
+
+    for i = 1, select("#", ...) do
+        local a = select(i, ...)
+
+        if a == nil then
+            error(`argument #$i of the Redis command is nil`, 0)
+        end
+
+        n = flatten(flat, n, a)
+    end
+
+    if n == 0 then
+        error("a Redis command needs a name", 0)
+    end
+
+    return flat, n
+end
+
+-- Encodes a command as an array of bulk strings. The result is a string, or
+-- a list of strings and vectors when an argument is a vector.
+local function encode(flat, n)
+    local parts = { `*$n\r\n` }
+    local count, binary = 1, false
+
+    for i = 1, n do
+        local a = flat[i]
+
+        if type(a) == "string" then
+            local len = #a
+
+            if find(a, NON_ASCII) then
+                len = #v_fromstring(a)
+            end
+
+            count = count + 1
+            parts[count] = `\$$len\r\n$a\r\n`
+        else
+            binary = true
+            parts[count + 1] = `\$$(#a)\r\n`
+            parts[count + 2] = a
+            parts[count + 3] = "\r\n"
+            count = count + 3
+        end
+    end
+
+    if binary then
+        return parts
+    end
+
+    return concat(parts)
+end
+
+-- Connections -------------------------------------------------------------------
+
+-- The second result of `read` for an error reply and for a push message.
+local Tag = enum err, push end
+
+-- Returns the error object for a failure of the socket. `cause` is the
+-- error object of the socket, whose code "timeout" sets the `timeout` field.
+local function socket_error(cause)
+    local err = new_error("CONNECTION", tostring(cause))
+
+    if type(cause) == "table" and cause.code == "timeout" then
+        err.timeout = true
+    end
+
+    return err
+end
+
+-- Marks the connection as broken and raises an error object. `cause` is a
+-- message, or the error object of a failed socket operation.
+local function fail(conn, code, cause)
+    conn.broken = true
+
+    if type(cause) == "string" then
+        error(new_error(code, cause), 0)
+    end
+
+    error(socket_error(cause), 0)
+end
+
+local function send(conn, payload)
+    local sock = conn.sock
+
+    if type(payload) == "string" then
+        local sent, err = sock:send(payload)
+
+        if sent == nil then
+            fail(conn, "CONNECTION", err)
+        end
+
+        return
+    end
+
+    -- Adjacent strings travel in one write.
+    local pending, count = {}, 0
+
+    for i = 1, #payload do
+        local part = payload[i]
+
+        if type(part) == "table" then
+            if count > 0 then
+                send(conn, concat(pending, "", 1, count))
+                count = 0
+            end
+
+            send(conn, part)
+        elseif type(part) == "string" then
+            count = count + 1
+            pending[count] = part
+        else
+            if count > 0 then
+                send(conn, concat(pending, "", 1, count))
+                count = 0
+            end
+
+            local sent, err = sock:send(part)
+
+            if sent == nil then
+                fail(conn, "CONNECTION", err)
+            end
+        end
+    end
+
+    if count > 0 then
+        send(conn, concat(pending, "", 1, count))
+    end
+end
+
+local function read_line(conn)
+    local line, err = conn.sock:receive("*l")
+
+    if line == nil then
+        fail(conn, "CONNECTION", err)
+    end
+
+    if #line == 0 then
+        fail(conn, "CONNECTION", "the server closed the connection")
+    end
+
+    return v_tostring(line, 0, #line, "lossy")
+end
+
+local CHUNK = 1 << 20
+
+-- Reads a bulk payload of `n` bytes and its line end.
+local function read_bulk(conn, n)
+    local sock = conn.sock
+    local data
+
+    if n + 2 <= CHUNK then
+        local err
+        data, err = sock:receive(n + 2)
+
+        if data == nil then
+            fail(conn, "CONNECTION", err)
+        end
+
+        if #data < n + 2 then
+            fail(conn, "CONNECTION", "the server closed the connection")
+        end
+    else
+        data = v_create(n)
+        local at = 0
+
+        while at < n + 2 do
+            local want = n + 2 - at
+
+            if want > CHUNK then
+                want = CHUNK
+            end
+
+            local part, err = sock:receive(want)
+
+            if part == nil then
+                fail(conn, "CONNECTION", err)
+            end
+
+            if #part < want then
+                fail(conn, "CONNECTION", "the server closed the connection")
+            end
+
+            local keep = #part
+
+            if at + keep > n then
+                keep = n - at
+            end
+
+            if keep > 0 then
+                v_copy(data, at, part, 0, keep)
+            end
+
+            at = at + want
+        end
+    end
+
+    if ok, text = catch v_tostring(data, 0, n) then
+        return text
+    end
+
+    if #data ~= n then
+        local bytes = v_create(n)
+
+        if n > 0 then
+            v_copy(bytes, 0, data, 0, n)
+        end
+
+        return bytes
+    end
+
+    return data
+end
+
+local function count_of(conn, rest)
+    local n = tonumber(rest)
+
+    if math_type(n) ~= "integer" then
+        fail(conn, "PROTOCOL", `the reply has the invalid length '$rest'`)
+    end
+
+    return n
+end
+
+-- Reads one reply. The second result is `Tag.err` when the reply is an error,
+-- whose object is the first result, and `Tag.push` when it is a push message.
+local function read(conn)
+    local line = read_line(conn)
+    local kind = byte(line, 1)
+    local rest = sub(line, 2)
+
+    if kind == 36 then  -- $
+        local n = count_of(conn, rest)
+
+        if n < 0 then
+            return nil
+        end
+
+        return read_bulk(conn, n)
+    elseif kind == 43 then  -- +
+        return rest
+    elseif kind == 58 then  -- :
+        return tonumber(rest)
+    elseif kind == 45 then  -- -
+        return server_error(rest), Tag.err
+    elseif kind == 42 or kind == 62 then  -- * and >
+        local n = count_of(conn, rest)
+
+        if n < 0 then
+            return nil
+        end
+
+        local list = {}
+
+        for i = 1, n do
+            list[i] = (read(conn))
+        end
+
+        if kind == 62 then
+            return list, Tag.push
+        end
+
+        return list
+    elseif kind == 95 then  -- _
+        return nil
+    elseif kind == 37 then  -- %
+        local map = {}
+
+        for _ = 1, count_of(conn, rest) do
+            local key = read(conn)
+            local value = read(conn)
+
+            if key ~= nil then
+                map[key] = value
+            end
+        end
+
+        return map
+    elseif kind == 126 then  -- ~
+        local set = {}
+
+        for _ = 1, count_of(conn, rest) do
+            local member = read(conn)
+
+            if member ~= nil then
+                set[member] = true
+            end
+        end
+
+        return set
+    elseif kind == 35 then  -- #
+        return rest == "t"
+    elseif kind == 44 then  -- ,
+        if rest == "inf" or rest == "+inf" then
+            return math.huge
+        elseif rest == "-inf" then
+            return -math.huge
+        elseif rest == "nan" or rest == "-nan" then
+            return 0 / 0
+        end
+
+        return tonumber(rest)
+    elseif kind == 40 then  -- (
+        return bigint(rest)
+    elseif kind == 33 then  -- !
+        local text = read_bulk(conn, count_of(conn, rest))
+
+        if type(text) ~= "string" then
+            text = v_tostring(text, 0, #text, "lossy")
+        end
+
+        return server_error(text), Tag.err
+    elseif kind == 61 then  -- =
+        local text = read_bulk(conn, count_of(conn, rest))
+        return type(text) == "string" and sub(text, 5) or text
+    elseif kind == 124 then  -- |
+        for _ = 1, count_of(conn, rest) * 2 do
+            read(conn)
+        end
+
+        return read(conn)
+    end
+
+    fail(conn, "PROTOCOL", `the reply starts with the unknown type '$(sub(line, 1, 1))'`)
+end
+
+-- Reads the reply of a command, passing over push messages.
+local function read_reply(conn)
+    local value, tag = read(conn)
+
+    while tag == Tag.push do
+        value, tag = read(conn)
+    end
+
+    return value, tag
+end
+
+-- Sends one command and returns its reply and the tag of `read`. `busy`
+-- stays true when an error interrupts the exchange, which tells the pool to
+-- close the connection.
+local function roundtrip(conn, payload)
+    conn.busy = true
+    send(conn, payload)
+    local value, tag = read_reply(conn)
+    conn.busy = false
+    return value, tag
+end
+
+local function request(conn, ...)
+    local flat, n = collect(...)
+    local value, tag = roundtrip(conn, encode(flat, n))
+
+    if tag then
+        error(value, 0)
+    end
+
+    return value
+end
+
+-- RESP2 replies ------------------------------------------------------------------
+
+local function pairs_to_map(list)
+    local map = {}
+
+    for i = 1, #list, 2 do
+        map[list[i]] = list[i + 1]
+    end
+
+    return map
+end
+
+local function list_to_set(list)
+    local set = {}
+
+    for i = 1, #list do
+        set[list[i]] = true
+    end
+
+    return set
+end
+
+local function text_to_number(text)
+    return tonumber(text)
+end
+
+-- The commands whose RESP2 reply differs in type from their RESP3 reply.
+local RESP2 = {
+    HGETALL = pairs_to_map,
+    ["CONFIG GET"] = pairs_to_map,
+    SMEMBERS = list_to_set,
+    SINTER = list_to_set,
+    SUNION = list_to_set,
+    SDIFF = list_to_set,
+    ZSCORE = text_to_number,
+    ZINCRBY = text_to_number,
+}
+
+-- Converts the RESP2 reply of the command in `flat` to its RESP3 value.
+local function reshape(flat, value)
+    local name = flat[1]
+
+    if value == nil or type(name) ~= "string" or getmetatable(value) == Error then
+        return value
+    end
+
+    name = upper(name)
+    local convert = RESP2[name]
+
+    if convert == nil and name == "CONFIG" and type(flat[2]) == "string" then
+        convert = RESP2[`$name $(upper(flat[2]))`]
+    end
+
+    if convert and (type(value) == "table" or convert == text_to_number) then
+        return convert(value)
+    end
+
+    return value
+end
+
+P.Error = Error
+P.Tag = Tag
+P.EMPTY = EMPTY
+P.new_error = new_error
+P.socket_error = socket_error
+P.collect = collect
+P.encode = encode
+P.send = send
+P.read = read
+P.read_reply = read_reply
+P.roundtrip = roundtrip
+P.request = request
+P.reshape = reshape
+
+return P

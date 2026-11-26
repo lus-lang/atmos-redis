@@ -1,0 +1,422 @@
+-- The stores of the redis package for the rate_limit, session, and queue
+-- packages. Each store runs its atomic operations as Lua scripts on the
+-- server.
+
+local S = {}
+
+local setmetatable, tonumber, type = setmetatable, tonumber, type
+local ceil from math
+local max_of = math.max
+local format from string
+
+-- The store of rate_limit ----------------------------------------------------------
+
+local function milliseconds(seconds)
+    return max_of(1, ceil(seconds * 1000))
+end
+
+local RATE_INCR = [[
+-- rate_limit.incr
+local count = redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  ttl = tonumber(ARGV[2])
+  redis.call('PEXPIRE', KEYS[1], ttl)
+end
+return {count, ttl}
+]]
+
+local RATE_TAKE = [[
+-- rate_limit.take
+local cost, interval = tonumber(ARGV[1]), tonumber(ARGV[2])
+local burst, now = tonumber(ARGV[3]), tonumber(ARGV[4])
+local stored = redis.call('GET', KEYS[1])
+local full_at = stored and tonumber(stored)
+if not full_at or full_at < now then
+  full_at = now
+end
+local debt = full_at + cost * interval - now
+if debt > burst * interval + 1e-9 then
+  return {0, string.format('%.17g', full_at - now)}
+end
+local ttl = math.max(1, math.ceil(debt * 1000))
+redis.call('SET', KEYS[1], string.format('%.17g', now + debt), 'PX', ttl)
+return {1, string.format('%.17g', debt)}
+]]
+
+local RateStore = {}
+RateStore.__index = RateStore
+
+function RateStore:incr(key, ttl, amount)
+    local reply = self.incr_script({ self.prefix .. key }, amount or 1, milliseconds(ttl))
+    return tonumber(reply[1]), reply[2] / 1000
+end
+
+function RateStore:get(key)
+    local value = self.client:call("GET", self.prefix .. key)
+    return value and tonumber(value) or nil
+end
+
+function RateStore:set(key, value, ttl)
+    self.client:call("SET", self.prefix .. key, format("%.17g", value), "PX", milliseconds(ttl))
+end
+
+function RateStore:take(key, cost, interval, burst, now)
+    local reply = self.take_script(
+        { self.prefix .. key },
+        format("%.17g", cost),
+        format("%.17g", interval),
+        format("%.17g", burst),
+        format("%.17g", now)
+    )
+    return reply[1] == 1, tonumber(reply[2])
+end
+
+function S.rate_limit(client, options)
+    return setmetatable({
+        client = client,
+        prefix = options?.prefix or "rate_limit:",
+        incr_script = client:script(RATE_INCR),
+        take_script = client:script(RATE_TAKE),
+    }, RateStore)
+end
+
+-- The store of session -------------------------------------------------------------
+
+local SessionStore = {}
+SessionStore.__index = SessionStore
+
+function SessionStore:get(id)
+    local text = self.client:call("GET", self.prefix .. id)
+
+    if type(text) ~= "string" then
+        return nil
+    end
+
+    return fromjson(text)
+end
+
+function SessionStore:set(id, data, ttl)
+    self.client:call("SET", self.prefix .. id, tojson(data), "PX", milliseconds(ttl))
+end
+
+function SessionStore:destroy(id)
+    self.client:call("DEL", self.prefix .. id)
+end
+
+function S.session(client, options)
+    return setmetatable({
+        client = client,
+        prefix = options?.prefix or "session:",
+    }, SessionStore)
+end
+
+-- The store of queue ---------------------------------------------------------------
+
+-- Every key of a queue starts with `KEYS[1]`, which ends in a hash tag, so
+-- the keys of one queue share a slot of a cluster.
+--
+-- - `job:ID` is a hash with the fields of a job and its sequence number.
+-- - `timed` is a sorted set of the waiting jobs by the time they become due.
+-- - `ready` is a sorted set of the due jobs. The score is the negated
+--   priority. The member is the due time and the sequence number as two
+--   numbers of 15 digits, then the id, so the first member is the job that
+--   workers take first.
+-- - `active` is a sorted set of the claimed jobs by the end of their lease.
+-- - `stale` is a set of the jobs in `ready` whose lease ran out, which
+--   stay active until a worker claims them again.
+-- - `completed` and `failed` are sorted sets by the time the jobs ended.
+-- - `seq` counts the jobs.
+
+local QUEUE_ADD = [[
+-- queue.add
+local base = KEYS[1]
+local job = base .. 'job:' .. ARGV[1]
+if redis.call('EXISTS', job) == 1 then
+  return 0
+end
+local seq = redis.call('INCR', base .. 'seq')
+redis.call('HSET', job, 'id', ARGV[1], 'data', ARGV[2], 'status', 'waiting',
+  'priority', ARGV[3], 'attempts', 0, 'max_attempts', ARGV[4],
+  'run_at', ARGV[5], 'created_at', ARGV[6], 'seq', seq)
+redis.call('ZADD', base .. 'timed', ARGV[5], ARGV[1])
+return 1
+]]
+
+local QUEUE_CLAIM = [[
+-- queue.claim
+local base = KEYS[1]
+local now, lease = ARGV[1], ARGV[2]
+local ready = base .. 'ready'
+local function promote(source, stale)
+  local ids = redis.call('ZRANGEBYSCORE', source, '-inf', now)
+  for i = 1, #ids do
+    local id = ids[i]
+    local f = redis.call('HMGET', base .. 'job:' .. id, 'priority', 'run_at', 'seq')
+    redis.call('ZREM', source, id)
+    if f[1] then
+      local member = string.format('%015.0f%015.0f', tonumber(f[2]), tonumber(f[3])) .. id
+      redis.call('ZADD', ready, -tonumber(f[1]), member)
+      if stale then
+        redis.call('SADD', base .. 'stale', id)
+      end
+    end
+  end
+end
+promote(base .. 'active', true)
+promote(base .. 'timed', false)
+while true do
+  local first = redis.call('ZRANGE', ready, 0, 0)
+  if #first == 0 then
+    return false
+  end
+  redis.call('ZREM', ready, first[1])
+  local id = string.sub(first[1], 31)
+  local job = base .. 'job:' .. id
+  redis.call('SREM', base .. 'stale', id)
+  if redis.call('EXISTS', job) == 1 then
+    local attempts = redis.call('HINCRBY', job, 'attempts', 1)
+    redis.call('HSET', job, 'status', 'active', 'run_at', lease)
+    redis.call('ZADD', base .. 'active', lease, id)
+    local f = redis.call('HMGET', job, 'data', 'max_attempts', 'priority', 'created_at')
+    return {id, f[1], attempts, tonumber(f[2]), tonumber(f[3]), tonumber(f[4])}
+  end
+end
+]]
+
+-- The start of `complete` and `fail`: the job must be active with the
+-- attempts of the caller, and it leaves the sets of the active jobs.
+local QUEUE_HELD = [[
+local base = KEYS[1]
+local id = ARGV[1]
+local job = base .. 'job:' .. id
+local f = redis.call('HMGET', job, 'status', 'attempts', 'run_at', 'seq')
+if f[1] ~= 'active' or f[2] ~= ARGV[2] then
+  return 0
+end
+redis.call('ZREM', base .. 'active', id)
+if redis.call('SREM', base .. 'stale', id) == 1 then
+  local member = string.format('%015.0f%015.0f', tonumber(f[3]), tonumber(f[4])) .. id
+  redis.call('ZREM', base .. 'ready', member)
+end
+]]
+
+local QUEUE_COMPLETE = `-- queue.complete\n$QUEUE_HELD` .. [[
+if ARGV[4] == '1' then
+  redis.call('DEL', job)
+else
+  redis.call('HSET', job, 'status', 'completed', 'finished_at', ARGV[3])
+  redis.call('ZADD', base .. 'completed', ARGV[3], id)
+end
+return 1
+]]
+
+local QUEUE_FAIL = `-- queue.fail\n$QUEUE_HELD` .. [[
+if ARGV[5] ~= '' then
+  redis.call('HSET', job, 'status', 'waiting', 'run_at', ARGV[5], 'last_error', ARGV[3])
+  redis.call('ZADD', base .. 'timed', ARGV[5], id)
+else
+  redis.call('HSET', job, 'status', 'failed', 'finished_at', ARGV[4], 'last_error', ARGV[3])
+  redis.call('ZADD', base .. 'failed', ARGV[4], id)
+end
+return 1
+]]
+
+local QUEUE_STATS = [[
+-- queue.stats
+local base = KEYS[1]
+local stale = redis.call('SCARD', base .. 'stale')
+local timed = redis.call('ZCARD', base .. 'timed')
+local due = redis.call('ZCOUNT', base .. 'timed', '-inf', ARGV[1])
+return {
+  redis.call('ZCARD', base .. 'ready') - stale + due,
+  timed - due,
+  redis.call('ZCARD', base .. 'active') + stale,
+  redis.call('ZCARD', base .. 'completed'),
+  redis.call('ZCARD', base .. 'failed'),
+}
+]]
+
+local QUEUE_NEXT_AT = [[
+-- queue.next_at
+local base = KEYS[1]
+local at = false
+local function consider(value)
+  value = tonumber(value)
+  if value and (not at or value < at) then
+    at = value
+  end
+end
+local first = redis.call('ZRANGE', base .. 'ready', 0, 0)
+if first[1] then
+  consider(string.sub(first[1], 1, 15))
+end
+consider(redis.call('ZRANGE', base .. 'timed', 0, 0, 'WITHSCORES')[2])
+consider(redis.call('ZRANGE', base .. 'active', 0, 0, 'WITHSCORES')[2])
+return at
+]]
+
+local QUEUE_RETRY_FAILED = [[
+-- queue.retry_failed
+local base = KEYS[1]
+local ids = redis.call('ZRANGE', base .. 'failed', 0, -1)
+for i = 1, #ids do
+  local job = base .. 'job:' .. ids[i]
+  redis.call('HSET', job, 'status', 'waiting', 'attempts', 0, 'run_at', ARGV[1])
+  redis.call('HDEL', job, 'finished_at')
+  redis.call('ZADD', base .. 'timed', ARGV[1], ids[i])
+end
+redis.call('DEL', base .. 'failed')
+return #ids
+]]
+
+local QUEUE_CLEAN = [[
+-- queue.clean
+local base = KEYS[1]
+if ARGV[1] ~= 'completed' and ARGV[1] ~= 'failed' then
+  return 0
+end
+local set = base .. ARGV[1]
+local ids = redis.call('ZRANGEBYSCORE', set, '-inf', ARGV[2])
+for i = 1, #ids do
+  redis.call('DEL', base .. 'job:' .. ids[i])
+end
+redis.call('ZREMRANGEBYSCORE', set, '-inf', ARGV[2])
+return #ids
+]]
+
+local QueueStore = {}
+QueueStore.__index = QueueStore
+
+-- Times and counts travel as whole numbers.
+local function whole(n)
+    return format("%.0f", n)
+end
+
+local function base_of(self, queue)
+    return { `$(self.prefix){$queue}:` }
+end
+
+function QueueStore:add(queue, job)
+    return self.add_script(
+        base_of(self, queue),
+        job.id,
+        job.data,
+        whole(job.priority),
+        whole(job.max_attempts),
+        whole(job.run_at),
+        whole(job.created_at)
+    )
+        == 1
+end
+
+function QueueStore:claim(queue, now, lease)
+    local reply = self.claim_script(base_of(self, queue), whole(now), whole(lease))
+
+    if reply == nil then
+        return nil
+    end
+
+    return {
+        id = reply[1],
+        data = reply[2],
+        attempts = reply[3],
+        max_attempts = reply[4],
+        priority = reply[5],
+        created_at = reply[6],
+    }
+end
+
+function QueueStore:complete(queue, id, attempts, now, remove)
+    return self.complete_script(
+        base_of(self, queue),
+        id,
+        whole(attempts),
+        whole(now),
+        remove and "1" or "0"
+    )
+        == 1
+end
+
+function QueueStore:fail(queue, id, attempts, message, now, retry_at)
+    return self.fail_script(
+        base_of(self, queue),
+        id,
+        whole(attempts),
+        message,
+        whole(now),
+        retry_at and whole(retry_at) or ""
+    )
+        == 1
+end
+
+local JOB_NUMBERS = {
+    "priority",
+    "attempts",
+    "max_attempts",
+    "run_at",
+    "created_at",
+    "finished_at",
+}
+
+function QueueStore:get(queue, id)
+    local job = self.client:call("HGETALL", `$(base_of(self, queue)[1])job:$id`)
+
+    if job.id == nil then
+        return nil
+    end
+
+    for i = 1, #JOB_NUMBERS do
+        local name = JOB_NUMBERS[i]
+
+        if job[name] ~= nil then
+            job[name] = tonumber(job[name])
+        end
+    end
+
+    job.seq = nil
+    return job
+end
+
+function QueueStore:stats(queue, now)
+    local reply = self.stats_script(base_of(self, queue), whole(now))
+    return {
+        waiting = reply[1],
+        delayed = reply[2],
+        active = reply[3],
+        completed = reply[4],
+        failed = reply[5],
+    }
+end
+
+function QueueStore:next_at(queue)
+    return self.next_at_script(base_of(self, queue))
+end
+
+function QueueStore:retry_failed(queue, now)
+    return self.retry_failed_script(base_of(self, queue), whole(now))
+end
+
+function QueueStore:clean(queue, status, before)
+    return self.clean_script(base_of(self, queue), status, whole(before))
+end
+
+function QueueStore:close()
+end
+
+function S.queue(client, options)
+    return setmetatable({
+        client = client,
+        prefix = options?.prefix or "queue:",
+        add_script = client:script(QUEUE_ADD),
+        claim_script = client:script(QUEUE_CLAIM),
+        complete_script = client:script(QUEUE_COMPLETE),
+        fail_script = client:script(QUEUE_FAIL),
+        stats_script = client:script(QUEUE_STATS),
+        next_at_script = client:script(QUEUE_NEXT_AT),
+        retry_failed_script = client:script(QUEUE_RETRY_FAILED),
+        clean_script = client:script(QUEUE_CLEAN),
+    }, QueueStore)
+end
+
+return S

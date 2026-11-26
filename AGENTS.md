@@ -8,7 +8,9 @@
 
 ## Layout
 
-- `redis.lus` is the whole package. Its header doc comment contains the package metadata and the declared permissions.
+- `redis.lus` is the main module, with the pool, the client, pipelines, transactions, publish and subscribe, scripts, and scans. Its header doc comment contains the package metadata and the declared permissions, and it holds the doc comments of every public function.
+- `redis/protocol.lus` holds the error objects, the encoding of commands, and the reading of RESP3 and RESP2 replies.
+- `redis/stores.lus` holds the stores of `rate_limit`, `session`, and `queue` with their Lua scripts.
 - `tests/*_test.lus` are the tests. They load `redis.lus` from the parent of `TEST_DIR`, the directory that holds the test file.
 - `tests/fake_redis.lus` is the server that the tests talk to. It speaks RESP3 and RESP2 on a loopback port and keeps its data in tables. It runs each Lua script of the stores as a Lus function of the same name in `F.scripts`, which it finds by the comment on the first line of the script.
 
@@ -25,7 +27,7 @@ Run these commands from the root of the repository.
 
 ```sh
 lus test tests          # run the tests
-lus check redis.lus     # lint
+lus check redis.lus redis     # lint
 lus doc redis.lus       # print the reference
 ```
 
@@ -34,7 +36,7 @@ The tests bind loopback ports, so they need a shell that allows it. Two more tes
 ## Rules
 
 - Every public function has a doc comment that states each result and each error, following `spec/design/style.md` of the Lus repository.
-- The package never calls `pledge`. A new permission is declared in the header and in the README.
+- The package never calls `pledge`. A new permission is declared in the header.
 - A change to a Lua script of a store comes with the same change to its Lus function in `tests/fake_redis.lus` and with a run of the tests against a real server.
 - Prose follows the `lus-writing` skill, which `lus agents init` installs and https://lus.dev/agents/skills/lus-writing/SKILL.md serves. In particular, prose has no dashes or semicolons and never names the Roblox Lua dialect.
 - Every bug fix comes with a test that fails without it.

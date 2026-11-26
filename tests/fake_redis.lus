@@ -26,6 +26,7 @@ end
 local function encode(out, v, resp3)
     local n = #out
     local t = type(v)
+
     if v == nil then
         out[n + 1] = resp3 and "_\r\n" or "$-1\r\n"
     elseif t == "string" then
@@ -38,7 +39,9 @@ local function encode(out, v, resp3)
         if math.type(v) == "integer" then
             out[n + 1] = `:$v\r\n`
         elseif resp3 then
-            local text = v == math.huge and "inf" or v == -math.huge and "-inf" or string.format("%.17g", v)
+            local text = v == math.huge and "inf"
+                or v == -math.huge and "-inf"
+                or string.format("%.17g", v)
             out[n + 1] = `,$text\r\n`
         else
             encode(out, string.format("%.17g", v), resp3)
@@ -66,22 +69,27 @@ local function encode(out, v, resp3)
         if resp3 then
             out[n + 1] = "|1\r\n+ttl\r\n:3600\r\n"
         end
+
         encode(out, v[1], resp3)
     elseif v.t == "map" then
         local count = v.n or #v
         out[n + 1] = resp3 and `%$(count // 2)\r\n` or `*$count\r\n`
+
         for i = 1, count do
             encode(out, v[i], resp3)
         end
     else
         local count = v.n or #v
         local mark = "*"
+
         if resp3 and v.t == "set" then
             mark = "~"
         elseif resp3 and v.t == "push" then
             mark = ">"
         end
+
         out[n + 1] = `$mark$count\r\n`
+
         for i = 1, count do
             encode(out, v[i], resp3)
         end
@@ -92,8 +100,10 @@ local function write(conn, value)
     local out = {}
     encode(out, value, conn.resp3)
     local pending = {}
+
     for i = 1, #out do
         local part = out[i]
+
         if type(part) == "string" then
             pending[#pending + 1] = part
         else
@@ -101,9 +111,11 @@ local function write(conn, value)
                 conn.sock:send(table.concat(pending))
                 pending = {}
             end
+
             conn.sock:send(part)
         end
     end
+
     if #pending > 0 then
         conn.sock:send(table.concat(pending))
     end
@@ -113,31 +125,41 @@ end
 
 local function read_command(sock)
     local line = sock:receive("*l")
+
     if line == nil or #line == 0 then
         return nil
     end
+
     local count = tonumber(vector.tostring(line):match("^%*(%d+)$"))
+
     if count == nil then
         return nil
     end
+
     local args = {}
+
     for i = 1, count do
         local head = vector.tostring(assert(sock:receive("*l")))
         local len = tonumber(head:match("^%$(%d+)$"))
         local data = vector.create(len)
         local at = 0
+
         while at < len do
             local part = sock:receive(math.min(len - at, 1 << 20))
+
             if part == nil or #part == 0 then
                 return nil
             end
+
             vector.copy(data, at, part)
             at = at + #part
         end
+
         sock:receive(2)
         local ok, text = catch vector.tostring(data)
         args[i] = ok and text or data
     end
+
     return args
 end
 
@@ -146,27 +168,33 @@ end
 local function entry_of(conn, key, kind)
     local db = conn.db
     local entry = db[key]
-    if entry and entry.expires and entry.expires <= conn.server.now then
+
+    if entry?.expires and entry.expires <= conn.server.now then
         db[key] = nil
         entry = nil
     end
+
     if entry and kind and entry.kind ~= kind then
         raise("WRONGTYPE Operation against a key holding the wrong kind of value")
     end
+
     return entry
 end
 
 local function make(conn, key, kind)
     local entry = entry_of(conn, key, kind)
+
     if entry == nil then
         entry = { kind = kind, value = kind == "string" and "" or {} }
         conn.db[key] = entry
     end
+
     return entry
 end
 
 local function drop_if_empty(conn, key)
     local entry = conn.db[key]
+
     if entry and type(entry.value) == "table" and next(entry.value) == nil then
         conn.db[key] = nil
     end
@@ -174,9 +202,11 @@ end
 
 local function integer(text)
     local n = math.tointeger(tonumber(text))
+
     if n == nil then
         raise("ERR value is not an integer or out of range")
     end
+
     return n
 end
 
@@ -186,10 +216,13 @@ local function number(text)
     elseif text == "+inf" or text == "inf" then
         return math.huge
     end
+
     local n = tonumber(text)
+
     if n == nil then
         raise("ERR value is not a valid float")
     end
+
     return n
 end
 
@@ -197,31 +230,38 @@ local function number_text(n)
     if n == math.floor(n) and math.abs(n) < 1e17 then
         return string.format("%.0f", n)
     end
+
     return string.format("%.17g", n)
 end
 
 -- The members of a sorted set in the order of the server.
 local function ranked(entry)
     local list = {}
+
     if entry then
         for member, score in pairs(entry.value) do
             list[#list + 1] = { member, score }
         end
+
         table.sort(list, function(a, b)
             if a[2] ~= b[2] then
                 return a[2] < b[2]
             end
+
             return a[1] < b[1]
         end)
     end
+
     return list
 end
 
 local function sorted_keys(t)
     local keys = {}
+
     for k in pairs(t) do
         keys[#keys + 1] = k
     end
+
     table.sort(keys)
     return keys
 end
@@ -239,10 +279,13 @@ function C.PING(_, a)
     if a[2] then
         return a[2]
     end
+
     return { t = "simple", "PONG" }
 end
 
-function C.ECHO(_, a) return a[2] end
+function C.ECHO(_, a)
+    return a[2]
+end
 
 function C.SELECT(conn, a)
     local index = integer(a[2])
@@ -255,6 +298,7 @@ end
 
 function C.CLIENT(conn, a)
     local sub = a[2]:upper()
+
     if sub == "SETNAME" then
         conn.name = a[3]
         return OK
@@ -263,16 +307,19 @@ function C.CLIENT(conn, a)
     elseif sub == "ID" then
         return conn.id
     end
+
     raise("ERR unknown subcommand")
 end
 
 function C.DBSIZE(conn)
     local n = 0
+
     for key in pairs(conn.db) do
         if entry_of(conn, key) then
             n = n + 1
         end
     end
+
     return n
 end
 
@@ -280,6 +327,7 @@ function C.FLUSHALL(conn)
     for key in pairs(conn.db) do
         conn.db[key] = nil
     end
+
     return OK
 end
 
@@ -287,19 +335,21 @@ function C.CONFIG(_, a)
     if a[2]:upper() == "GET" then
         return { t = "map", a[3], "0" }
     end
+
     return OK
 end
 
 function C.GET(conn, a)
-    local entry = entry_of(conn, a[2], "string")
-    return entry and entry.value or nil
+    return entry_of(conn, a[2], "string")?.value
 end
 
 function C.SET(conn, a)
     local expires, nx, xx, get = nil, false, false, false
     local i = 4
+
     while a[i] do
         local flag = a[i]:upper()
+
         if flag == "EX" then
             expires = conn.server.now + integer(a[i + 1]) * 1000
             i = i + 1
@@ -315,52 +365,63 @@ function C.SET(conn, a)
         else
             raise("ERR syntax error")
         end
+
         i = i + 1
     end
+
     local old = entry_of(conn, a[2])
+
     if (nx and old) or (xx and not old) then
         return nil
     end
+
     conn.db[a[2]] = { kind = "string", value = a[3], expires = expires }
+
     if get then
-        return old and old.value or nil
+        return old?.value
     end
+
     return OK
 end
 
 function C.MGET(conn, a)
     local out = { t = "arr", n = #a - 1 }
+
     for i = 2, #a do
         local entry = entry_of(conn, a[i])
-        out[i - 1] = entry and entry.kind == "string" and entry.value or nil
+        out[i - 1] = entry?.kind == "string" and entry.value or nil
     end
+
     return out
 end
 
 function C.DEL(conn, a)
     local n = 0
+
     for i = 2, #a do
         if entry_of(conn, a[i]) then
             conn.db[a[i]] = nil
             n = n + 1
         end
     end
+
     return n
 end
 
 function C.EXISTS(conn, a)
     local n = 0
+
     for i = 2, #a do
         if entry_of(conn, a[i]) then
             n = n + 1
         end
     end
+
     return n
 end
 
 function C.TYPE(conn, a)
-    local entry = entry_of(conn, a[2])
-    return { t = "simple", entry and entry.kind or "none" }
+    return { t = "simple", entry_of(conn, a[2])?.kind or "none" }
 end
 
 local function incr_by(conn, key, amount)
@@ -370,9 +431,17 @@ local function incr_by(conn, key, amount)
     return n + amount
 end
 
-function C.INCR(conn, a) return incr_by(conn, a[2], 1) end
-function C.DECR(conn, a) return incr_by(conn, a[2], -1) end
-function C.INCRBY(conn, a) return incr_by(conn, a[2], integer(a[3])) end
+function C.INCR(conn, a)
+    return incr_by(conn, a[2], 1)
+end
+
+function C.DECR(conn, a)
+    return incr_by(conn, a[2], -1)
+end
+
+function C.INCRBY(conn, a)
+    return incr_by(conn, a[2], integer(a[3]))
+end
 
 function C.INCRBYFLOAT(conn, a)
     local entry = make(conn, a[2], "string")
@@ -383,31 +452,42 @@ end
 
 local function expire(conn, key, ms)
     local entry = entry_of(conn, key)
+
     if entry == nil then
         return 0
     end
+
     entry.expires = conn.server.now + ms
     return 1
 end
 
-function C.EXPIRE(conn, a) return expire(conn, a[2], integer(a[3]) * 1000) end
-function C.PEXPIRE(conn, a) return expire(conn, a[2], integer(a[3])) end
+function C.EXPIRE(conn, a)
+    return expire(conn, a[2], integer(a[3]) * 1000)
+end
+
+function C.PEXPIRE(conn, a)
+    return expire(conn, a[2], integer(a[3]))
+end
 
 function C.PTTL(conn, a)
     local entry = entry_of(conn, a[2])
+
     if entry == nil then
         return -2
     elseif entry.expires == nil then
         return -1
     end
+
     return entry.expires - conn.server.now
 end
 
 function C.TTL(conn, a)
     local ms = C.PTTL(conn, a)
+
     if ms < 0 then
         return ms
     end
+
     return (ms + 500) // 1000
 end
 
@@ -415,46 +495,54 @@ function C.HSET(conn, a)
     if #a < 4 or #a % 2 ~= 0 then
         raise("ERR wrong number of arguments for 'hset' command")
     end
+
     local hash = make(conn, a[2], "hash").value
     local added = 0
+
     for i = 3, #a, 2 do
         if hash[a[i]] == nil then
             added = added + 1
         end
+
         hash[a[i]] = a[i + 1]
     end
+
     return added
 end
 
 function C.HGET(conn, a)
-    local entry = entry_of(conn, a[2], "hash")
-    return entry and entry.value[a[3]] or nil
+    return entry_of(conn, a[2], "hash")?.value[a[3]]
 end
 
 function C.HMGET(conn, a)
     local entry = entry_of(conn, a[2], "hash")
     local out = { t = "arr", n = #a - 2 }
+
     for i = 3, #a do
-        out[i - 2] = entry and entry.value[a[i]] or nil
+        out[i - 2] = entry?.value[a[i]]
     end
+
     return out
 end
 
 function C.HGETALL(conn, a)
     local entry = entry_of(conn, a[2], "hash")
     local out = { t = "map" }
+
     if entry then
         for _, field in ipairs(sorted_keys(entry.value)) do
             out[#out + 1] = field
             out[#out + 1] = entry.value[field]
         end
     end
+
     return out
 end
 
 function C.HDEL(conn, a)
     local entry = entry_of(conn, a[2], "hash")
     local n = 0
+
     if entry then
         for i = 3, #a do
             if entry.value[a[i]] ~= nil then
@@ -462,8 +550,10 @@ function C.HDEL(conn, a)
                 n = n + 1
             end
         end
+
         drop_if_empty(conn, a[2])
     end
+
     return n
 end
 
@@ -477,18 +567,21 @@ end
 function C.SADD(conn, a)
     local set = make(conn, a[2], "set").value
     local n = 0
+
     for i = 3, #a do
         if not set[a[i]] then
             set[a[i]] = true
             n = n + 1
         end
     end
+
     return n
 end
 
 function C.SREM(conn, a)
     local entry = entry_of(conn, a[2], "set")
     local n = 0
+
     if entry then
         for i = 3, #a do
             if entry.value[a[i]] then
@@ -496,8 +589,10 @@ function C.SREM(conn, a)
                 n = n + 1
             end
         end
+
         drop_if_empty(conn, a[2])
     end
+
     return n
 end
 
@@ -516,28 +611,35 @@ end
 function C.ZADD(conn, a)
     local i = 3
     local nx = false
+
     if a[i]:upper() == "NX" then
         nx = true
         i = i + 1
     end
+
     local zset = make(conn, a[2], "zset").value
     local added = 0
+
     while a[i] do
         local score, member = number(a[i]), a[i + 1]
+
         if zset[member] == nil then
             added = added + 1
             zset[member] = score
         elseif not nx then
             zset[member] = score
         end
+
         i = i + 2
     end
+
     return added
 end
 
 function C.ZREM(conn, a)
     local entry = entry_of(conn, a[2], "zset")
     local n = 0
+
     if entry then
         for i = 3, #a do
             if entry.value[a[i]] ~= nil then
@@ -545,8 +647,10 @@ function C.ZREM(conn, a)
                 n = n + 1
             end
         end
+
         drop_if_empty(conn, a[2])
     end
+
     return n
 end
 
@@ -555,21 +659,24 @@ function C.ZCARD(conn, a)
 end
 
 function C.ZSCORE(conn, a)
-    local entry = entry_of(conn, a[2], "zset")
-    local score = entry and entry.value[a[3]]
+    local score = entry_of(conn, a[2], "zset")?.value[a[3]]
+
     if score == nil then
         return nil
     end
+
     return score + 0.0
 end
 
 local function in_range(conn, key, low, high)
     local out = {}
+
     for _, item in ipairs(ranked(entry_of(conn, key, "zset"))) do
         if item[2] >= low and item[2] <= high then
             out[#out + 1] = item
         end
     end
+
     return out
 end
 
@@ -579,17 +686,21 @@ end
 
 function C.ZRANGEBYSCORE(conn, a)
     local out = {}
+
     for _, item in ipairs(in_range(conn, a[2], number(a[3]), number(a[4]))) do
         out[#out + 1] = item[1]
     end
+
     return out
 end
 
 function C.ZREMRANGEBYSCORE(conn, a)
     local items = in_range(conn, a[2], number(a[3]), number(a[4]))
+
     for _, item in ipairs(items) do
         conn.db[a[2]].value[item[1]] = nil
     end
+
     drop_if_empty(conn, a[2])
     return #items
 end
@@ -598,20 +709,26 @@ end
 function C.ZRANGE(conn, a)
     local items = ranked(entry_of(conn, a[2], "zset"))
     local first, last = integer(a[3]), integer(a[4])
+
     if first < 0 then
         first = #items + first
     end
+
     if last < 0 then
         last = #items + last
     end
-    local scores = a[5] and a[5]:upper() == "WITHSCORES"
+
+    local scores = a[5]?:upper() == "WITHSCORES"
     local out = {}
+
     for i = first + 1, math.min(last + 1, #items) do
         out[#out + 1] = items[i][1]
+
         if scores then
             out[#out + 1] = number_text(items[i][2])
         end
     end
+
     return out
 end
 
@@ -621,35 +738,44 @@ local function scan(items, a, at, width)
     local cursor = integer(a[at])
     local pattern, count = nil, 2
     local i = at + 1
+
     while a[i] do
         local flag = a[i]:upper()
+
         if flag == "MATCH" then
             pattern = glob(a[i + 1])
         elseif flag == "COUNT" then
             count = integer(a[i + 1])
         end
+
         i = i + 2
     end
+
     local out = {}
     local stop = math.min(cursor + count, #items // width)
+
     for n = cursor + 1, stop do
         local base = (n - 1) * width
+
         if pattern == nil or items[base + 1]:find(pattern) then
             for w = 1, width do
                 out[#out + 1] = items[base + w]
             end
         end
     end
+
     return { tostring(stop >= #items // width and 0 or stop), out }
 end
 
 function C.SCAN(conn, a)
     local keys = {}
+
     for _, key in ipairs(sorted_keys(conn.db)) do
         if entry_of(conn, key) then
             keys[#keys + 1] = key
         end
     end
+
     return scan(keys, a, 2, 1)
 end
 
@@ -664,10 +790,12 @@ end
 
 function C.ZSCAN(conn, a)
     local items = {}
+
     for _, item in ipairs(ranked(entry_of(conn, a[2], "zset"))) do
         items[#items + 1] = item[1]
         items[#items + 1] = number_text(item[2])
     end
+
     return scan(items, a, 3, 2)
 end
 
@@ -675,59 +803,84 @@ end
 
 local function count_subs(conn)
     local n = 0
+
     for _ in pairs(conn.channels) do
         n = n + 1
     end
+
     for _ in pairs(conn.patterns) do
         n = n + 1
     end
+
     return n
 end
 
 local function subscribe(conn, a, field, kind)
     local server = conn.server
+
     for i = 2, #a do
         conn[field][a[i]] = true
         server[field][a[i]] = server[field][a[i]] or {}
         server[field][a[i]][conn] = true
         write(conn, { t = "push", kind, a[i], count_subs(conn) })
     end
+
     return F.NOREPLY
 end
 
 local function unsubscribe(conn, a, field, kind)
     local names = {}
+
     for i = 2, #a do
         names[#names + 1] = a[i]
     end
+
     if #names == 0 then
         names = sorted_keys(conn[field])
     end
+
     if #names == 0 then
         write(conn, { t = "push", n = 3, kind, nil, count_subs(conn) })
     end
+
     for _, name in ipairs(names) do
         conn[field][name] = nil
+
         if conn.server[field][name] then
             conn.server[field][name][conn] = nil
         end
+
         write(conn, { t = "push", kind, name, count_subs(conn) })
     end
+
     return F.NOREPLY
 end
 
-function C.SUBSCRIBE(conn, a) return subscribe(conn, a, "channels", "subscribe") end
-function C.PSUBSCRIBE(conn, a) return subscribe(conn, a, "patterns", "psubscribe") end
-function C.UNSUBSCRIBE(conn, a) return unsubscribe(conn, a, "channels", "unsubscribe") end
-function C.PUNSUBSCRIBE(conn, a) return unsubscribe(conn, a, "patterns", "punsubscribe") end
+function C.SUBSCRIBE(conn, a)
+    return subscribe(conn, a, "channels", "subscribe")
+end
+
+function C.PSUBSCRIBE(conn, a)
+    return subscribe(conn, a, "patterns", "psubscribe")
+end
+
+function C.UNSUBSCRIBE(conn, a)
+    return unsubscribe(conn, a, "channels", "unsubscribe")
+end
+
+function C.PUNSUBSCRIBE(conn, a)
+    return unsubscribe(conn, a, "patterns", "punsubscribe")
+end
 
 function C.PUBLISH(conn, a)
     local server = conn.server
     local n = 0
+
     for target in pairs(server.channels[a[2]] or {}) do
         write(target, { t = "push", "message", a[2], a[3] })
         n = n + 1
     end
+
     for pattern, targets in pairs(server.patterns) do
         if a[2]:find(glob(pattern)) then
             for target in pairs(targets) do
@@ -736,6 +889,7 @@ function C.PUBLISH(conn, a)
             end
         end
     end
+
     return n
 end
 
@@ -757,10 +911,12 @@ end
 
 function C.WATCH(conn, a)
     conn.watch = conn.watch or {}
+
     for i = 2, #a do
         local id = `$(conn.dbi):$(a[i])`
         conn.watch[id] = conn.server.versions[id] or 0
     end
+
     return OK
 end
 
@@ -771,24 +927,31 @@ end
 
 function C.EXEC(conn)
     local queue = conn.multi
+
     if queue == nil then
         raise("ERR EXEC without MULTI")
     end
+
     conn.multi = nil
     local watch = conn.watch
     conn.watch = nil
+
     if conn.multi_failed then
         raise("EXECABORT Transaction discarded because of previous errors.")
     end
+
     for id, version in pairs(watch or {}) do
         if (conn.server.versions[id] or 0) ~= version then
             return { t = "null_array" }
         end
     end
+
     local out = { t = "arr", n = #queue }
+
     for i, args in ipairs(queue) do
         out[i] = dispatch(conn, args)
     end
+
     return out
 end
 
@@ -804,14 +967,18 @@ local function to_script(v)
         elseif v.t == "err" then
             error(v, 0)
         end
+
         local out = {}
+
         for i = 1, v.n or #v do
             out[i] = to_script(v[i])
         end
+
         return out
     elseif math.type(v) == "float" then
         return number_text(v)
     end
+
     return v
 end
 
@@ -825,12 +992,15 @@ local function from_script(v)
         return math.tointeger(v) or math.tointeger(v // 1)
     elseif type(v) == "table" and v.t == nil then
         local out = { t = "arr" }
+
         for i = 1, #v do
             out[i] = from_script(v[i])
         end
+
         out.n = #v
         return out
     end
+
     return v
 end
 
@@ -838,6 +1008,7 @@ local function tostr(v)
     if math.type(v) == "float" then
         return number_text(v)
     end
+
     return tostring(v)
 end
 
@@ -845,11 +1016,21 @@ F.scripts = {}
 
 -- The sources that the fake knows by their whole text.
 F.sources = {
-    ["return ARGV[1]"] = function(_, _, ARGV) return ARGV[1] end,
-    ["return {KEYS[1], ARGV[1], 7}"] = function(_, KEYS, ARGV) return { KEYS[1], ARGV[1], 7 } end,
-    ["return redis.call('GET', KEYS[1])"] = function(call, KEYS) return call("GET", KEYS[1]) end,
-    ["return redis.call('INCR', KEYS[1])"] = function(call, KEYS) return call("INCR", KEYS[1]) end,
-    ["return redis.error_reply('MYERR boom')"] = function() return err("MYERR boom") end,
+    ["return ARGV[1]"] = function(_, _, ARGV)
+        return ARGV[1]
+    end,
+    ["return {KEYS[1], ARGV[1], 7}"] = function(_, KEYS, ARGV)
+        return { KEYS[1], ARGV[1], 7 }
+    end,
+    ["return redis.call('GET', KEYS[1])"] = function(call, KEYS)
+        return call("GET", KEYS[1])
+    end,
+    ["return redis.call('INCR', KEYS[1])"] = function(call, KEYS)
+        return call("INCR", KEYS[1])
+    end,
+    ["return redis.error_reply('MYERR boom')"] = function()
+        return err("MYERR boom")
+    end,
 }
 
 local function sha_of(source)
@@ -858,38 +1039,52 @@ end
 
 local function find_script(source)
     local fn = F.sources[source]
+
     if fn == nil then
         local name = source:match("^%-%- ([%w_.]+)\n")
         fn = name and F.scripts[name]
     end
+
     if fn == nil then
         raise("ERR Error compiling script (the fake server does not know this script)")
     end
+
     return fn
 end
 
 local function run_script(conn, fn, a)
     local numkeys = integer(a[3])
     local KEYS, ARGV = {}, {}
+
     for i = 1, numkeys do
         KEYS[i] = a[3 + i]
     end
+
     for i = 4 + numkeys, #a do
         ARGV[#ARGV + 1] = a[i]
     end
+
     local function call(name, ...)
         local args = { name }
         local given = table.pack(...)
+
         for i = 1, given.n do
             args[i + 1] = tostr(given[i])
         end
+
         local handler = C[name]
         conn.server.script_calls = conn.server.script_calls + 1
+
+        local versions = conn.server.versions
+
         for i = 2, #args do
-            conn.server.versions[`$(conn.dbi):$(args[i])`] = (conn.server.versions[`$(conn.dbi):$(args[i])`] or 0) + 1
+            local id = `$(conn.dbi):$(args[i])`
+            versions[id] = (versions[id] or 0) + 1
         end
+
         return to_script(handler(conn, args))
     end
+
     return from_script(fn(call, KEYS, ARGV))
 end
 
@@ -901,14 +1096,17 @@ end
 
 function C.EVALSHA(conn, a)
     local fn = conn.server.loaded[a[2]]
+
     if fn == nil then
         raise("NOSCRIPT No matching script. Please use EVAL.")
     end
+
     return run_script(conn, fn, a)
 end
 
 function C.SCRIPT(conn, a)
     local sub = a[2]:upper()
+
     if sub == "LOAD" then
         local sha = sha_of(a[3])
         conn.server.loaded[sha] = find_script(a[3])
@@ -919,11 +1117,14 @@ function C.SCRIPT(conn, a)
         return OK
     elseif sub == "EXISTS" then
         local out = {}
+
         for i = 3, #a do
             out[i - 2] = conn.server.loaded[a[i]] and 1 or 0
         end
+
         return out
     end
+
     raise("ERR unknown subcommand")
 end
 
@@ -932,10 +1133,12 @@ end
 F.scripts["rate_limit.incr"] = function(call, KEYS, ARGV)
     local count = call("INCRBYFLOAT", KEYS[1], ARGV[1])
     local ttl = call("PTTL", KEYS[1])
+
     if ttl < 0 then
         ttl = tonumber(ARGV[2])
         call("PEXPIRE", KEYS[1], ttl)
     end
+
     return { count, ttl }
 end
 
@@ -944,13 +1147,17 @@ F.scripts["rate_limit.take"] = function(call, KEYS, ARGV)
     local burst, now = tonumber(ARGV[3]), tonumber(ARGV[4])
     local stored = call("GET", KEYS[1])
     local full_at = stored and tonumber(stored)
+
     if not full_at or full_at < now then
         full_at = now
     end
+
     local debt = full_at + cost * interval - now
+
     if debt > burst * interval + 1e-9 then
         return { 0, string.format("%.17g", full_at - now) }
     end
+
     local ttl = math.max(1, math.ceil(debt * 1000))
     call("SET", KEYS[1], string.format("%.17g", now + debt), "PX", ttl)
     return { 1, string.format("%.17g", debt) }
@@ -959,13 +1166,34 @@ end
 F.scripts["queue.add"] = function(call, KEYS, ARGV)
     local base = KEYS[1]
     local job = `$(base)job:$(ARGV[1])`
+
     if call("EXISTS", job) == 1 then
         return 0
     end
+
     local seq = call("INCR", `$(base)seq`)
-    call("HSET", job, "id", ARGV[1], "data", ARGV[2], "status", "waiting",
-        "priority", ARGV[3], "attempts", 0, "max_attempts", ARGV[4],
-        "run_at", ARGV[5], "created_at", ARGV[6], "seq", seq)
+    call(
+        "HSET",
+        job,
+        "id",
+        ARGV[1],
+        "data",
+        ARGV[2],
+        "status",
+        "waiting",
+        "priority",
+        ARGV[3],
+        "attempts",
+        0,
+        "max_attempts",
+        ARGV[4],
+        "run_at",
+        ARGV[5],
+        "created_at",
+        ARGV[6],
+        "seq",
+        seq
+    )
     call("ZADD", `$(base)timed`, ARGV[5], ARGV[1])
     return 1
 end
@@ -974,32 +1202,41 @@ F.scripts["queue.claim"] = function(call, KEYS, ARGV)
     local base = KEYS[1]
     local now, lease = ARGV[1], ARGV[2]
     local ready = `$(base)ready`
+
     local function promote(source, stale)
         local ids = call("ZRANGEBYSCORE", source, "-inf", now)
+
         for i = 1, #ids do
             local id = ids[i]
             local f = call("HMGET", `$(base)job:$id`, "priority", "run_at", "seq")
             call("ZREM", source, id)
+
             if f[1] then
                 local member = string.format("%015.0f%015.0f", tonumber(f[2]), tonumber(f[3])) .. id
                 call("ZADD", ready, -tonumber(f[1]), member)
+
                 if stale then
                     call("SADD", `$(base)stale`, id)
                 end
             end
         end
     end
+
     promote(`$(base)active`, true)
     promote(`$(base)timed`, false)
+
     while true do
         local first = call("ZRANGE", ready, 0, 0)
+
         if #first == 0 then
             return false
         end
+
         call("ZREM", ready, first[1])
         local id = string.sub(first[1], 31)
         local job = `$(base)job:$id`
         call("SREM", `$(base)stale`, id)
+
         if call("EXISTS", job) == 1 then
             local attempts = call("HINCRBY", job, "attempts", 1)
             call("HSET", job, "status", "active", "run_at", lease)
@@ -1016,36 +1253,45 @@ local function held(call, KEYS, ARGV)
     local id = ARGV[1]
     local job = `$(base)job:$id`
     local f = call("HMGET", job, "status", "attempts", "run_at", "seq")
+
     if f[1] ~= "active" or f[2] ~= ARGV[2] then
         return nil
     end
+
     call("ZREM", `$(base)active`, id)
+
     if call("SREM", `$(base)stale`, id) == 1 then
         local member = string.format("%015.0f%015.0f", tonumber(f[3]), tonumber(f[4])) .. id
         call("ZREM", `$(base)ready`, member)
     end
+
     return base, id, job
 end
 
 F.scripts["queue.complete"] = function(call, KEYS, ARGV)
     local base, id, job = held(call, KEYS, ARGV)
+
     if base == nil then
         return 0
     end
+
     if ARGV[4] == "1" then
         call("DEL", job)
     else
         call("HSET", job, "status", "completed", "finished_at", ARGV[3])
         call("ZADD", `$(base)completed`, ARGV[3], id)
     end
+
     return 1
 end
 
 F.scripts["queue.fail"] = function(call, KEYS, ARGV)
     local base, id, job = held(call, KEYS, ARGV)
+
     if base == nil then
         return 0
     end
+
     if ARGV[5] ~= "" then
         call("HSET", job, "status", "waiting", "run_at", ARGV[5], "last_error", ARGV[3])
         call("ZADD", `$(base)timed`, ARGV[5], id)
@@ -1053,6 +1299,7 @@ F.scripts["queue.fail"] = function(call, KEYS, ARGV)
         call("HSET", job, "status", "failed", "finished_at", ARGV[4], "last_error", ARGV[3])
         call("ZADD", `$(base)failed`, ARGV[4], id)
     end
+
     return 1
 end
 
@@ -1073,16 +1320,21 @@ end
 F.scripts["queue.next_at"] = function(call, KEYS)
     local base = KEYS[1]
     local at = false
+
     local function consider(value)
         value = value and tonumber(value)
+
         if value and (not at or value < at) then
             at = value
         end
     end
+
     local first = call("ZRANGE", `$(base)ready`, 0, 0)
+
     if first[1] then
         consider(string.sub(first[1], 1, 15))
     end
+
     consider(call("ZRANGE", `$(base)timed`, 0, 0, "WITHSCORES")[2])
     consider(call("ZRANGE", `$(base)active`, 0, 0, "WITHSCORES")[2])
     return at
@@ -1091,26 +1343,32 @@ end
 F.scripts["queue.retry_failed"] = function(call, KEYS, ARGV)
     local base = KEYS[1]
     local ids = call("ZRANGE", `$(base)failed`, 0, -1)
+
     for i = 1, #ids do
         local job = `$(base)job:$(ids[i])`
         call("HSET", job, "status", "waiting", "attempts", 0, "run_at", ARGV[1])
         call("HDEL", job, "finished_at")
         call("ZADD", `$(base)timed`, ARGV[1], ids[i])
     end
+
     call("DEL", `$(base)failed`)
     return #ids
 end
 
 F.scripts["queue.clean"] = function(call, KEYS, ARGV)
     local base = KEYS[1]
+
     if ARGV[1] ~= "completed" and ARGV[1] ~= "failed" then
         return 0
     end
+
     local set = base .. ARGV[1]
     local ids = call("ZRANGEBYSCORE", set, "-inf", ARGV[2])
+
     for i = 1, #ids do
         call("DEL", `$(base)job:$(ids[i])`)
     end
+
     call("ZREMRANGEBYSCORE", set, "-inf", ARGV[2])
     return #ids
 end
@@ -1119,6 +1377,7 @@ end
 
 function C.FAKE(conn, a)
     local kind = a[2]
+
     if kind == "double" then
         return tonumber(a[3]) + 0.0
     elseif kind == "inf" then
@@ -1138,7 +1397,17 @@ function C.FAKE(conn, a)
     elseif kind == "set" then
         return { t = "set", "a", "b", 3 }
     elseif kind == "map" then
-        return { t = "map", "name", "Ada", "tags", { t = "set", "x" }, "n", 2, "nested", { t = "map", "k", { 1, 2 } } }
+        return {
+            t = "map",
+            "name",
+            "Ada",
+            "tags",
+            { t = "set", "x" },
+            "n",
+            2,
+            "nested",
+            { t = "map", "k", { 1, 2 } },
+        }
     elseif kind == "nulls" then
         return { t = "arr", n = 3, "a", nil, "c" }
     elseif kind == "push" then
@@ -1157,6 +1426,7 @@ function C.FAKE(conn, a)
         conn.sock:send("?what\r\n")
         return F.NOREPLY
     end
+
     raise("ERR unknown fake reply")
 end
 
@@ -1167,54 +1437,81 @@ F.NOREPLY = {}
 -- The commands that change a key, whose first key the server marks for
 -- WATCH. DEL marks each of its keys.
 local WRITES = {
-    SET = true, DEL = true, INCR = true, DECR = true, INCRBY = true, INCRBYFLOAT = true, EXPIRE = true,
-    PEXPIRE = true, HSET = true, HDEL = true, HINCRBY = true, SADD = true, SREM = true, ZADD = true,
-    ZREM = true, ZREMRANGEBYSCORE = true,
+    SET = true,
+    DEL = true,
+    INCR = true,
+    DECR = true,
+    INCRBY = true,
+    INCRBYFLOAT = true,
+    EXPIRE = true,
+    PEXPIRE = true,
+    HSET = true,
+    HDEL = true,
+    HINCRBY = true,
+    SADD = true,
+    SREM = true,
+    ZADD = true,
+    ZREM = true,
+    ZREMRANGEBYSCORE = true,
 }
 
 function dispatch(conn, args)
     local name = type(args[1]) == "string" and args[1]:upper() or "?"
     local handler = C[name]
+
     if handler == nil then
-        return err(`ERR unknown command '$(tostring(args[1]))'`)
+        return err(`ERR unknown command '$(args[1])'`)
     end
+
     local server = conn.server
     server.log[#server.log + 1] = name
+
     if WRITES[name] then
         for i = 2, name == "DEL" and #args or 2 do
-            local id = `$(conn.dbi):$(tostring(args[i]))`
+            local id = `$(conn.dbi):$(args[i])`
             server.versions[id] = (server.versions[id] or 0) + 1
         end
     end
+
     local ok, reply = catch handler(conn, args)
+
     if not ok then
         if type(reply) == "table" and reply.t == "err" then
             return reply
         end
-        return err(`ERR $(tostring(reply))`)
+
+        return err(`ERR $reply`)
     end
+
     return reply
 end
 
 local function hello(conn, a)
     local server = conn.server
     local options = server.options
+
     if options.resp2 then
         if options.password and not conn.authed then
             return err("NOAUTH Authentication required.")
         end
+
         return err("ERR unknown command 'HELLO'")
     end
+
     if a[2] ~= "3" then
         return err("NOPROTO unsupported protocol version")
     end
+
     local i = 3
+
     while a[i] do
         local word = a[i]:upper()
+
         if word == "AUTH" then
             if a[i + 1] ~= (options.username or "default") or a[i + 2] ~= options.password then
                 return err("WRONGPASS invalid username-password pair or user is disabled.")
             end
+
             conn.authed = true
             i = i + 3
         elseif word == "SETNAME" then
@@ -1224,25 +1521,45 @@ local function hello(conn, a)
             return err("ERR syntax error in HELLO")
         end
     end
+
     if options.password and not conn.authed then
         return err("NOAUTH HELLO must be called with the client already authenticated")
     end
+
     conn.resp3 = true
-    return { t = "map", "server", "fake", "version", "7.4.0", "proto", 3, "id", conn.id, "mode", "standalone" }
+    return {
+        t = "map",
+        "server",
+        "fake",
+        "version",
+        "7.4.0",
+        "proto",
+        3,
+        "id",
+        conn.id,
+        "mode",
+        "standalone",
+    }
 end
 
 local function auth(conn, a)
     local options = conn.server.options
     local user, password = "default", a[2]
+
     if a[3] then
         user, password = a[2], a[3]
     end
+
     if options.password == nil then
-        return err("ERR AUTH <password> called without any password configured for the default user.")
+        return err(
+            "ERR AUTH <password> called without any password configured for the default user."
+        )
     end
+
     if user ~= (options.username or "default") or password ~= options.password then
         return err("WRONGPASS invalid username-password pair or user is disabled.")
     end
+
     conn.authed = true
     return OK
 end
@@ -1252,13 +1569,17 @@ local IMMEDIATE = { EXEC = true, DISCARD = true, MULTI = true, WATCH = true, UNW
 local function serve(conn)
     local server = conn.server
     local sock = conn.sock
+
     while true do
         local args = read_command(sock)
+
         if args == nil then
             break
         end
+
         local name = type(args[1]) == "string" and args[1]:upper() or "?"
         local reply
+
         if name == "HELLO" then
             reply = hello(conn, args)
         elseif name == "AUTH" then
@@ -1282,6 +1603,7 @@ local function serve(conn)
         else
             reply = dispatch(conn, args)
         end
+
         if reply ~= F.NOREPLY then
             write(conn, reply)
         end
@@ -1291,16 +1613,20 @@ end
 local function handle(conn)
     local server = conn.server
     local tls = server.options.tls
+
     -- A server with a certificate serves TLS from the first byte.
     if not tls or conn.sock:starttls(tls) then
         catch serve(conn)
     end
+
     for name in pairs(conn.channels) do
         server.channels[name][conn] = nil
     end
+
     for name in pairs(conn.patterns) do
         server.patterns[name][conn] = nil
     end
+
     server.open = server.open - 1
     server.conns[conn] = nil
     conn.sock:close()
@@ -1310,7 +1636,8 @@ end
 ---
 --- The options are `password` and `username`, which make the server ask
 --- for them, `resp2`, which makes it refuse `HELLO` as an old server does,
---- and `tls`, the server options of `starttls` with which it serves TLS. The result has the fields `port` and `url`, the clock `now` in
+--- and `tls`, the server options of `starttls` with which it serves TLS.
+--- The result has the fields `port` and `url`, the clock `now` in
 --- milliseconds that a test moves by hand, the counters `accepted`, `open`,
 --- `loads`, and `script_calls`, the list `log` of the command names it
 --- ran, and the method `stop`.
@@ -1340,12 +1667,15 @@ function F.start(options)
     vector.set(server.blob, 1, 0)
     vector.set(server.blob, 2, 254)
     vector.set(server.blob, 3, 1)
+
     server.acceptor = coroutine.detach(coroutine.create(function()
         while true do
             local sock = listener:accept()
+
             if not sock then
                 return
             end
+
             server.accepted = server.accepted + 1
             server.open = server.open + 1
             local conn = {
@@ -1363,13 +1693,16 @@ function F.start(options)
             coroutine.detach(coroutine.create(handle), conn)
         end
     end))
+
     function server:stop()
         coroutine.close(self.acceptor)
         listener:close()
+
         for conn in pairs(self.conns) do
             conn.sock:close()
         end
     end
+
     return server
 end
 
